@@ -27,10 +27,10 @@ func main() {
 	runtime, err := plugin.ServeAndRecvSpec(&plugin.IntroSpect{
 		ID:            PluginID,
 		Name:          "Guardian",
-		Author:        "you",
-		AuthorContact: "you@example.com",
+		Author:        "6unsatiable",
+		AuthorContact: "articrevised@gmail.com",
 		Description:   "Dynamic-capture security plugin: IP allow/block lists, UA blocklist, WAF payload patterns, per-IP rate limiting. Host-scopable rules.",
-		URL:           "https://example.com/guardian",
+		URL:           "https://github.com/6unsatiable/zoraxy-guardian",
 		Type:          plugin.PluginType_Router,
 		VersionMajor:  0,
 		VersionMinor:  2,

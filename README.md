@@ -45,6 +45,21 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 
 ## Install (Docker bind-mount Zoraxy)
 
+### One-click install through Zoraxy's plugin directory
+
+Add this URL as a custom plugin directory in Zoraxy, then install **Guardian**
+from the Plugins page. Zoraxy selects and downloads the correct binary for its
+platform automatically:
+
+```
+https://raw.githubusercontent.com/6unsatiable/zoraxy-guardian/main/directories/index.json
+```
+
+The directory tracks the rolling `latest` release. Restart Zoraxy after an
+update if your deployment does not automatically restart plugins.
+
+### Manual / Docker install
+
 The same `update.sh` script also installs from scratch. On the Zoraxy host:
 
 ```bash
