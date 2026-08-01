@@ -33,7 +33,9 @@ func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.store.Snapshot())
 	case http.MethodPost:
 		var cfg Config
-		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&cfg); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -52,8 +54,8 @@ func (a *API) handleBlockLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
-	limit := atoiDefault(r.URL.Query().Get("limit"), 0) // 0 = all
+	offset := nonNegative(atoiDefault(r.URL.Query().Get("offset"), 0))
+	limit := nonNegative(atoiDefault(r.URL.Query().Get("limit"), 0)) // 0 = all
 	entries := a.store.LogPage(offset, limit)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"total":   a.store.LogTotal(),
@@ -185,7 +187,9 @@ func (a *API) handleImportCF(w http.ResponseWriter, r *http.Request) {
 		Expression string `json:"expression"`
 		Apply      bool   `json:"apply"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -227,6 +231,13 @@ func atoiDefault(s string, d int) int {
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		return d
+	}
+	return n
+}
+
+func nonNegative(n int) int {
+	if n < 0 {
+		return 0
 	}
 	return n
 }

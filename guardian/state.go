@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,16 +27,16 @@ type ScopedEntry struct {
 }
 
 type Config struct {
-	IPAllowlist         []ScopedEntry `json:"ip_allowlist"`
-	IPBlocklist         []ScopedEntry `json:"ip_blocklist"`
-	UABlocklist         []ScopedEntry `json:"ua_blocklist"`
-	HostBlocklist       []ScopedEntry `json:"host_blocklist"`
-	WAFRules            []WAFRule     `json:"waf_rules"`
-	RateLimit           RateLimit     `json:"rate_limit"`
-	Honeypot            Honeypot      `json:"honeypot"`
-	AutoBan             AutoBan       `json:"auto_ban"`
+	IPAllowlist         []ScopedEntry       `json:"ip_allowlist"`
+	IPBlocklist         []ScopedEntry       `json:"ip_blocklist"`
+	UABlocklist         []ScopedEntry       `json:"ua_blocklist"`
+	HostBlocklist       []ScopedEntry       `json:"host_blocklist"`
+	WAFRules            []WAFRule           `json:"waf_rules"`
+	RateLimit           RateLimit           `json:"rate_limit"`
+	Honeypot            Honeypot            `json:"honeypot"`
+	AutoBan             AutoBan             `json:"auto_ban"`
 	FingerprintTracking FingerprintTracking `json:"fingerprint_tracking"`
-	TrustXFF            bool          `json:"trust_xff"`
+	TrustXFF            bool                `json:"trust_xff"`
 }
 
 type WAFRule struct {
@@ -76,7 +77,7 @@ type AutoBan struct {
 // tooling/headers but rotating IPs.
 type FingerprintTracking struct {
 	Enabled       bool `json:"enabled"`
-	Threshold     int  `json:"threshold"`     // Strikes before signature ban
+	Threshold     int  `json:"threshold"`      // Strikes before signature ban
 	WindowSeconds int  `json:"window_seconds"` // Rolling window for strikes
 	BanSeconds    int  `json:"ban_seconds"`    // How long to ban the signature
 }
@@ -122,21 +123,22 @@ type Store struct {
 	configPath string
 	logPath    string
 
-	mu              sync.RWMutex
-	cfg             Config
-	allowRules      []compiledIPRule
-	blockRules      []compiledIPRule
-	uaRules         []compiledUARule
-	hostBlockRules  []compiledRegexRule
-	wafRules        []compiledRegexRule
-	wafRuleNames    []string
-	honeypotRules   []compiledGlobRule
-	limiter         *rateLimiter
-	log             *blockLog
-	bcast           *broadcaster
+	mu             sync.RWMutex
+	configMu       sync.Mutex
+	cfg            Config
+	allowRules     []compiledIPRule
+	blockRules     []compiledIPRule
+	uaRules        []compiledUARule
+	hostBlockRules []compiledRegexRule
+	wafRules       []compiledRegexRule
+	wafRuleNames   []string
+	honeypotRules  []compiledGlobRule
+	limiter        *rateLimiter
+	log            *blockLog
+	bcast          *broadcaster
 
 	pendingMu sync.Mutex
-	pending   map[string]Decision
+	pending   map[string]pendingDecision
 
 	// Temporary bans + strike tracking (separate mutex; hot path).
 	banMu              sync.Mutex
@@ -144,6 +146,16 @@ type Store struct {
 	strikes            map[string][]time.Time // IP -> recent strike timestamps
 	fingerprintBans    map[string]time.Time   // Fingerprint -> expiry
 	fingerprintStrikes map[string][]time.Time // Fingerprint -> strike timestamps
+}
+
+const (
+	maxPendingDecisions = 10000
+	pendingDecisionTTL  = 2 * time.Minute
+)
+
+type pendingDecision struct {
+	decision Decision
+	created  time.Time
 }
 
 type Decision struct {
@@ -156,7 +168,7 @@ func LoadState(configPath, logPath string) (*Store, error) {
 	s := &Store{
 		configPath:         configPath,
 		logPath:            logPath,
-		pending:            make(map[string]Decision),
+		pending:            make(map[string]pendingDecision),
 		tempBans:           make(map[string]time.Time),
 		strikes:            make(map[string][]time.Time),
 		fingerprintBans:    make(map[string]time.Time),
@@ -390,16 +402,96 @@ func (s *Store) Snapshot() Config {
 
 func (s *Store) Update(cfg Config) error {
 	cfg = mergeDefaults(cfg)
+	if err := validateConfig(cfg); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Persist before publishing the new configuration. This keeps the
+	// running policy and config.json consistent if the filesystem is full or
+	// otherwise unavailable.
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := atomicWriteFile(s.configPath, data, 0o644); err != nil {
+		return err
+	}
 	s.cfg = cfg
 	s.compile()
-	s.mu.Unlock()
-	return s.Save()
+	return nil
+}
+
+// validateConfig prevents a successful save from silently producing rules
+// that compile to no-op (or match everything because their value is empty).
+func validateConfig(cfg Config) error {
+	if err := validateIPEntries("IP allowlist", cfg.IPAllowlist); err != nil {
+		return err
+	}
+	if err := validateIPEntries("IP blocklist", cfg.IPBlocklist); err != nil {
+		return err
+	}
+	if err := validateRegexEntries("UA blocklist", cfg.UABlocklist); err != nil {
+		return err
+	}
+	if err := validateRegexEntries("host blocklist", cfg.HostBlocklist); err != nil {
+		return err
+	}
+	for i, r := range cfg.WAFRules {
+		if r.Name == "" || r.Pattern == "" {
+			return fmt.Errorf("WAF rule %d must have a name and pattern", i+1)
+		}
+		if _, err := regexp.Compile(r.Pattern); err != nil {
+			return fmt.Errorf("WAF rule %d: %w", i+1, err)
+		}
+	}
+	if cfg.RateLimit.Enabled && (cfg.RateLimit.RequestsPerMinute < 1 || cfg.RateLimit.Burst < 1) {
+		return fmt.Errorf("rate limit requests per minute and burst must be positive")
+	}
+	if cfg.Honeypot.Enabled && cfg.Honeypot.BanSeconds < 1 {
+		return fmt.Errorf("honeypot ban duration must be positive")
+	}
+	if cfg.AutoBan.Enabled && (cfg.AutoBan.Threshold < 1 || cfg.AutoBan.WindowSeconds < 1 || cfg.AutoBan.BanSeconds < 1) {
+		return fmt.Errorf("auto-ban threshold, window, and duration must be positive")
+	}
+	if cfg.FingerprintTracking.Enabled && (cfg.FingerprintTracking.Threshold < 1 || cfg.FingerprintTracking.WindowSeconds < 1 || cfg.FingerprintTracking.BanSeconds < 1) {
+		return fmt.Errorf("fingerprint threshold, window, and duration must be positive")
+	}
+	return nil
+}
+
+func validateIPEntries(name string, entries []ScopedEntry) error {
+	for i, entry := range entries {
+		if _, _, err := net.ParseCIDR(entry.Value); err == nil {
+			continue
+		}
+		if net.ParseIP(entry.Value) == nil {
+			return fmt.Errorf("%s entry %d is not a valid IP address or CIDR", name, i+1)
+		}
+	}
+	return nil
+}
+
+func validateRegexEntries(name string, entries []ScopedEntry) error {
+	for i, entry := range entries {
+		if entry.Value == "" {
+			return fmt.Errorf("%s entry %d must not be empty", name, i+1)
+		}
+		if _, err := regexp.Compile(entry.Value); err != nil {
+			return fmt.Errorf("%s entry %d: %w", name, i+1, err)
+		}
+	}
+	return nil
 }
 
 // Save writes config.json atomically via tmp + rename. Survives a crash
 // mid-write: either the new file is in place or the old one is.
 func (s *Store) Save() error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	s.mu.RLock()
 	data, err := json.MarshalIndent(s.cfg, "", "  ")
 	s.mu.RUnlock()
@@ -447,18 +539,30 @@ func (s *Store) RecordDecision(uuid string, d Decision) {
 		return
 	}
 	s.pendingMu.Lock()
-	s.pending[uuid] = d
-	s.pendingMu.Unlock()
+	defer s.pendingMu.Unlock()
+	now := time.Now()
+	for id, pending := range s.pending {
+		if now.Sub(pending.created) > pendingDecisionTTL {
+			delete(s.pending, id)
+		}
+	}
+	if len(s.pending) >= maxPendingDecisions {
+		return
+	}
+	s.pending[uuid] = pendingDecision{decision: d, created: now}
 }
 
 func (s *Store) TakeDecision(uuid string) (Decision, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	d, ok := s.pending[uuid]
+	pending, ok := s.pending[uuid]
 	if ok {
 		delete(s.pending, uuid)
 	}
-	return d, ok
+	if !ok || time.Since(pending.created) > pendingDecisionTTL {
+		return Decision{}, false
+	}
+	return pending.decision, true
 }
 
 func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
@@ -505,11 +609,27 @@ func (s *Store) LogPage(offset, limit int) []BlockLogEntry {
 	for i, e := range all {
 		rev[n-1-i] = e
 	}
+	// Offset and limit are ultimately supplied through query parameters.
+	// Clamp negatives before slicing so malformed requests cannot panic the
+	// plugin process. A zero limit retains the documented "all entries"
+	// behavior.
+	if offset < 0 {
+		offset = 0
+	}
+	if limit < 0 {
+		limit = 0
+	}
 	if offset >= n {
 		return []BlockLogEntry{}
 	}
+	remaining := n - offset
+	// Compare limit to the remaining entries before adding it to offset so a
+	// crafted, very large query value cannot overflow int and panic.
+	if limit <= 0 || limit >= remaining {
+		return rev[offset:]
+	}
 	end := offset + limit
-	if limit <= 0 || end > n {
+	if end > n {
 		end = n
 	}
 	return rev[offset:end]

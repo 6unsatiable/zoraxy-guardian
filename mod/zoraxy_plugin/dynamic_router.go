@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const maxDynamicSniffPayload = 1 << 20 // 1 MiB
+
 /*
 
 	Dynamic Path Handler
@@ -37,12 +39,16 @@ func (p *PathRouter) RegisterDynamicSniffHandler(sniff_ingress string, mux *http
 		}
 
 		// Decode the request payload
-		jsonBytes, err := io.ReadAll(r.Body)
+		jsonBytes, err := io.ReadAll(io.LimitReader(r.Body, maxDynamicSniffPayload+1))
 		if err != nil {
 			if p.enableDebugPrint {
 				fmt.Println("Error reading request body:", err)
 			}
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		if len(jsonBytes) > maxDynamicSniffPayload {
+			http.Error(w, "Request Entity Too Large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		payload, err := DecodeForwardRequestPayload(jsonBytes)

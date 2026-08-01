@@ -104,6 +104,16 @@ func TestParseCFIPSetIn(t *testing.T) {
 	}
 }
 
+func TestParseCFAndDoesNotBroadenRule(t *testing.T) {
+	res, err := ParseCloudflareRules(`http.request.uri.path contains "/admin" and http.user_agent contains "scanner"`)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(res.Honeypot) != 0 || len(res.UABlocklist) != 0 || len(res.Warnings) == 0 {
+		t.Fatalf("unsafe conjunction must be skipped with a warning, got %+v", res)
+	}
+}
+
 func TestMergeSkipsDuplicates(t *testing.T) {
 	cfg := Config{
 		Honeypot: Honeypot{Paths: []ScopedEntry{{Value: "/.env"}}},

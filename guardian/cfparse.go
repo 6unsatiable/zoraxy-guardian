@@ -361,12 +361,7 @@ func translate(node cfNode, constraints []cfPredicate, res *CFImportResult) {
 	switch n := node.(type) {
 	case cfBinary:
 		if strings.EqualFold(n.Op, "and") {
-			// Split children into constraints (path/uri.path ne X) and actions.
-			added := collectExceptions(n)
-			cs := append([]cfPredicate{}, constraints...)
-			cs = append(cs, added...)
-			translate(n.Left, cs, res)
-			translate(n.Right, cs, res)
+			translateAnd(n, constraints, res)
 			return
 		}
 		// 'or' — translate each side independently.
@@ -382,25 +377,92 @@ func translate(node cfNode, constraints []cfPredicate, res *CFImportResult) {
 	}
 }
 
-// collectExceptions walks an AND-tree and pulls out `path ne X` predicates.
-func collectExceptions(n cfBinary) []cfPredicate {
-	var out []cfPredicate
-	var walk func(cfNode)
-	walk = func(node cfNode) {
-		switch v := node.(type) {
-		case cfBinary:
-			if strings.EqualFold(v.Op, "and") {
-				walk(v.Left)
-				walk(v.Right)
+// translateAnd only imports conjunctions that Guardian can preserve exactly:
+// one UA predicate plus zero or more path-ne exceptions. Splitting other AND
+// expressions into separate rules would broaden a Cloudflare block rule and
+// can unexpectedly block legitimate traffic.
+func translateAnd(n cfBinary, constraints []cfPredicate, res *CFImportResult) {
+	predicates, ok := flattenAnd(n)
+	if ok {
+		cs := append([]cfPredicate{}, constraints...)
+		var actions []cfPredicate
+		for _, p := range predicates {
+			if isPathField(p.Field) && strings.EqualFold(p.Op, "ne") {
+				cs = append(cs, p)
+				continue
 			}
-		case cfPredicate:
-			if isPathField(v.Field) && strings.EqualFold(v.Op, "ne") {
-				out = append(out, v)
-			}
+			actions = append(actions, p)
 		}
+		if len(actions) == 1 && isUAField(actions[0].Field) &&
+			(strings.EqualFold(actions[0].Op, "contains") || strings.EqualFold(actions[0].Op, "matches")) {
+			translatePredicate(actions[0], cs, res)
+			return
+		}
+	} else if exceptions, action, valid := splitUAExceptionAnd(n); valid {
+		cs := append(append([]cfPredicate{}, constraints...), exceptions...)
+		translate(action, cs, res)
+		return
 	}
-	walk(n)
-	return out
+	res.Warnings = append(res.Warnings, "skipping AND expression — Guardian cannot preserve this grouped condition")
+}
+
+// splitUAExceptionAnd supports the common CF pattern
+// path ne "/robots.txt" and (ua contains "a" or ua contains "b").
+func splitUAExceptionAnd(n cfBinary) ([]cfPredicate, cfNode, bool) {
+	parts := flattenAndNodes(n)
+	var exceptions []cfPredicate
+	var action cfNode
+	for _, part := range parts {
+		if p, ok := part.(cfPredicate); ok && isPathField(p.Field) && strings.EqualFold(p.Op, "ne") {
+			exceptions = append(exceptions, p)
+			continue
+		}
+		if action != nil || !isUAOrExpression(part) {
+			return nil, nil, false
+		}
+		action = part
+	}
+	return exceptions, action, action != nil && len(exceptions) > 0
+}
+
+func flattenAndNodes(n cfNode) []cfNode {
+	if b, ok := n.(cfBinary); ok && strings.EqualFold(b.Op, "and") {
+		return append(flattenAndNodes(b.Left), flattenAndNodes(b.Right)...)
+	}
+	return []cfNode{n}
+}
+
+func isUAOrExpression(n cfNode) bool {
+	switch v := n.(type) {
+	case cfPredicate:
+		return isUAField(v.Field) && (strings.EqualFold(v.Op, "contains") || strings.EqualFold(v.Op, "matches"))
+	case cfBinary:
+		return strings.EqualFold(v.Op, "or") && isUAOrExpression(v.Left) && isUAOrExpression(v.Right)
+	default:
+		return false
+	}
+}
+
+func flattenAnd(n cfNode) ([]cfPredicate, bool) {
+	switch v := n.(type) {
+	case cfPredicate:
+		return []cfPredicate{v}, true
+	case cfBinary:
+		if !strings.EqualFold(v.Op, "and") {
+			return nil, false
+		}
+		left, ok := flattenAnd(v.Left)
+		if !ok {
+			return nil, false
+		}
+		right, ok := flattenAnd(v.Right)
+		if !ok {
+			return nil, false
+		}
+		return append(left, right...), true
+	default:
+		return nil, false
+	}
 }
 
 func exceptionPaths(constraints []cfPredicate) []string {

@@ -3,6 +3,7 @@ package guardian
 import (
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -100,7 +101,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			if !HostMatches(host, r.Hosts) {
 				continue
 			}
-			if r.RE.MatchString(req.RequestURI) {
+			if r.RE.MatchString(requestPath(req.RequestURI)) {
 				dur := time.Duration(honeypotBanSecs) * time.Second
 				s.AddTempBan(ip, dur)
 				return Decision{Block: true, Reason: "honeypot", Status: http.StatusForbidden}
@@ -187,16 +188,29 @@ func pathExempt(requestURI string, exceptPaths []string) bool {
 	if len(exceptPaths) == 0 {
 		return false
 	}
-	uri := strings.ToLower(requestURI)
+	path := strings.ToLower(requestPath(requestURI))
 	for _, p := range exceptPaths {
 		if p == "" {
 			continue
 		}
-		if strings.Contains(uri, strings.ToLower(p)) {
+		if strings.Contains(path, strings.ToLower(p)) {
 			return true
 		}
 	}
 	return false
+}
+
+// requestPath returns the path component of a request target without query
+// or fragment data. Path-specific rules must not be bypassed or triggered by
+// values embedded in a query string.
+func requestPath(requestURI string) string {
+	if u, err := url.ParseRequestURI(requestURI); err == nil && u.Path != "" {
+		return u.Path
+	}
+	if i := strings.IndexAny(requestURI, "?#"); i >= 0 {
+		return requestURI[:i]
+	}
+	return requestURI
 }
 
 func wafCheck(req *plugin.DynamicSniffForwardRequest, host string, rules []compiledRegexRule, names []string) string {
@@ -221,17 +235,24 @@ func clientIP(req *plugin.DynamicSniffForwardRequest, trustXFF bool) string {
 	if trustXFF {
 		if xff := firstHeader(req.Header, "X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
-			return strings.TrimSpace(parts[0])
+			if ip := net.ParseIP(strings.TrimSpace(parts[0])); ip != nil {
+				return ip.String()
+			}
 		}
 		if xri := firstHeader(req.Header, "X-Real-IP"); xri != "" {
-			return strings.TrimSpace(xri)
+			if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		return req.RemoteAddr
+	if err == nil {
+		return host
 	}
-	return host
+	if ip := net.ParseIP(strings.TrimSpace(req.RemoteAddr)); ip != nil {
+		return ip.String()
+	}
+	return req.RemoteAddr
 }
 
 func firstHeader(h map[string][]string, name string) string {

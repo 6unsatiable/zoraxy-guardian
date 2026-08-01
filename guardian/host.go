@@ -1,6 +1,7 @@
 package guardian
 
 import (
+	"net"
 	"regexp"
 	"strings"
 )
@@ -14,16 +15,26 @@ func HostMatches(host string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return true
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		host = host[:i]
-	}
+	host = normalizeHost(host)
 	for _, p := range patterns {
 		if matchOne(host, strings.ToLower(strings.TrimSpace(p))) {
 			return true
 		}
 	}
 	return false
+}
+
+// normalizeHost removes a valid port without corrupting IPv6 authorities.
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		// A bracketed IPv6 literal without a port is not an authority form
+		// emitted by net/http, but accepting it makes matching predictable.
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	return strings.ToLower(host)
 }
 
 func matchOne(host, pattern string) bool {

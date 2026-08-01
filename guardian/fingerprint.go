@@ -9,8 +9,9 @@ import (
 	plugin "example.com/guardian/mod/zoraxy_plugin"
 )
 
-// GenerateFingerprint creates a stable hash from request characteristics
-// that persist across IP changes: User-Agent, Accept headers, and HTTP version.
+// GenerateFingerprint creates a stable hash from a request signature that can
+// persist across IP changes: request target, authority, method, User-Agent,
+// Accept headers, and HTTP version.
 //
 // This allows tracking malicious actors even when they rotate IPs or use
 // distributed scanners, as long as they reuse the same tooling/headers.
@@ -20,7 +21,14 @@ func GenerateFingerprint(req *plugin.DynamicSniffForwardRequest) string {
 	accept := normalizeHeader(req.Header, "Accept")
 	acceptEnc := normalizeHeader(req.Header, "Accept-Encoding")
 	acceptLang := normalizeHeader(req.Header, "Accept-Language")
-	
+
+	// Do not create a shared fingerprint for requests carrying none of the
+	// distinguishing headers. Otherwise header-poor clients all collapse to
+	// one identity and can be collateral-banned by unrelated traffic.
+	if ua == "" && accept == "" && acceptEnc == "" && acceptLang == "" {
+		return ""
+	}
+
 	// Include HTTP version (HTTP/1.1, HTTP/2, etc.)
 	proto := req.Proto
 	if proto == "" {
@@ -34,10 +42,13 @@ func GenerateFingerprint(req *plugin.DynamicSniffForwardRequest) string {
 		"enc=" + acceptEnc,
 		"lang=" + acceptLang,
 		"proto=" + proto,
+		"host=" + normalizeHost(req.Host),
+		"method=" + strings.ToUpper(req.Method),
+		"target=" + req.RequestURI,
 	}
-	
+
 	raw := strings.Join(parts, "|")
-	
+
 	// Hash to keep it compact (32 chars hex)
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])[:16] // Use first 16 chars for readability

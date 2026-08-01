@@ -104,6 +104,18 @@ func TestUARule(t *testing.T) {
 	}
 }
 
+func TestUARulePathExceptionDoesNotMatchQuery(t *testing.T) {
+	s := newStore(t, Config{
+		UABlocklist: []ScopedEntry{{Value: `(?i)sqlmap`, ExceptPaths: []string{"/robots.txt"}}},
+	})
+	if d := s.Evaluate(req("x.test", "1.2.3.4", "sqlmap/1.0", "/admin?next=/robots.txt")); !d.Block || d.Reason != "ua-blocklist" {
+		t.Errorf("query string must not exempt a UA rule, got %+v", d)
+	}
+	if d := s.Evaluate(req("x.test", "1.2.3.4", "sqlmap/1.0", "/robots.txt?next=/admin")); d.Block {
+		t.Errorf("path exception should still match the path, got %+v", d)
+	}
+}
+
 func TestWAF(t *testing.T) {
 	s := newStore(t, Config{
 		WAFRules: []WAFRule{
@@ -120,6 +132,18 @@ func TestWAF(t *testing.T) {
 	}
 	if d := s.Evaluate(req("x.test", "1.2.3.4", "ua", "/?x=nope")); d.Block {
 		t.Errorf("disabled rule should not fire, got %+v", d)
+	}
+}
+
+func TestHoneypotDoesNotMatchQuery(t *testing.T) {
+	s := newStore(t, Config{
+		Honeypot: Honeypot{Enabled: true, BanSeconds: 60, Paths: []ScopedEntry{{Value: "/.env"}}},
+	})
+	if d := s.Evaluate(req("x.test", "1.2.3.4", "ua", "/normal?next=/.env")); d.Block {
+		t.Errorf("query string must not trigger a honeypot, got %+v", d)
+	}
+	if d := s.Evaluate(req("x.test", "1.2.3.4", "ua", "/.env?format=json")); !d.Block || d.Reason != "honeypot" {
+		t.Errorf("honeypot should match the path, got %+v", d)
 	}
 }
 
@@ -160,6 +184,19 @@ func TestTrustXFFToggle(t *testing.T) {
 	r2.Header["X-Forwarded-For"] = []string{"9.9.9.9"}
 	if d := s2.Evaluate(r2); d.Block {
 		t.Errorf("XFF must not be honored when distrusted, got %+v", d)
+	}
+}
+
+func TestMalformedForwardingHeadersFallBackToRemoteAddress(t *testing.T) {
+	s := newStore(t, Config{
+		IPBlocklist: []ScopedEntry{{Value: "127.0.0.1"}},
+		TrustXFF:    true,
+	})
+	r := req("x.test", "127.0.0.1", "ua", "/")
+	r.Header["X-Forwarded-For"] = []string{"not-an-ip"}
+	r.Header["X-Real-IP"] = []string{"also-not-an-ip"}
+	if d := s.Evaluate(r); !d.Block || d.Reason != "ip-blocklist" {
+		t.Errorf("malformed forwarding headers must not bypass IP rules, got %+v", d)
 	}
 }
 

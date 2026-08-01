@@ -9,9 +9,9 @@ import (
 )
 
 const (
-	maxBlockLog     = 500              // in-memory snapshot cap
-	rotateAtSize    = 5 * 1024 * 1024  // 5 MiB
-	rotateKeepLines = 2000             // lines kept on rotate
+	maxBlockLog     = 500             // in-memory snapshot cap
+	rotateAtSize    = 5 * 1024 * 1024 // 5 MiB
+	rotateKeepLines = 2000            // lines kept on rotate
 )
 
 // blockLog is an append-only JSONL writer backed by a bounded in-memory
@@ -33,7 +33,7 @@ func openBlockLog(path string, capLines int) (*blockLog, error) {
 	if err := bl.loadTail(); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func (bl *blockLog) rotateIfNeededLocked() {
 		start = len(bl.ring) - rotateKeepLines
 	}
 	tmp := bl.path + ".tmp"
-	w, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	w, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
@@ -152,8 +152,8 @@ func (bl *blockLog) rotateIfNeededLocked() {
 	bl.file.Close()
 	if err := os.Rename(tmp, bl.path); err != nil {
 		os.Remove(tmp)
-		bl.file, _ = os.OpenFile(bl.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		bl.file, _ = os.OpenFile(bl.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		return
 	}
-	bl.file, _ = os.OpenFile(bl.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	bl.file, _ = os.OpenFile(bl.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 }

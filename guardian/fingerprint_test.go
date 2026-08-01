@@ -113,3 +113,10 @@ func TestFingerprintCaseInsensitive(t *testing.T) {
 		t.Errorf("Expected identical fingerprints (case-insensitive), got %s and %s", fp1, fp2)
 	}
 }
+
+func TestFingerprintRequiresDistinguishingHeaders(t *testing.T) {
+	req := &plugin.DynamicSniffForwardRequest{Proto: "HTTP/1.1", Header: map[string][]string{}}
+	if got := GenerateFingerprint(req); got != "" {
+		t.Errorf("empty distinguishing headers fingerprint = %q, want empty", got)
+	}
+}

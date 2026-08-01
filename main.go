@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"example.com/guardian/guardian"
 	plugin "example.com/guardian/mod/zoraxy_plugin"
@@ -89,7 +90,14 @@ func main() {
 
 	addr := "127.0.0.1:" + strconv.Itoa(runtime.Port)
 	fmt.Println("Guardian listening on", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		panic(err)
 	}
 }
