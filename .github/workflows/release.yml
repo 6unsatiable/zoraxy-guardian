@@ -26,9 +26,12 @@ jobs:
     strategy:
       matrix:
         include:
+          - { goos: linux,   goarch: 386, ext: '' }
           - { goos: linux,   goarch: amd64, ext: '' }
           - { goos: linux,   goarch: arm64, ext: '' }
           - { goos: linux,   goarch: arm,   goarm: 7, ext: '' }
+          - { goos: linux,   goarch: mipsle, ext: '' }
+          - { goos: linux,   goarch: riscv64, ext: '' }
           - { goos: windows, goarch: amd64, ext: '.exe' }
           - { goos: darwin,  goarch: amd64, ext: '' }
           - { goos: darwin,  goarch: arm64, ext: '' }
