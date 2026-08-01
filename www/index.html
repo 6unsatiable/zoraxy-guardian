@@ -34,7 +34,7 @@
 <main>
   <section id="tab-ip" class="tab-panel active">
     <h2>Allowlist</h2>
-    <p class="hint">If at least one allow rule applies to a host, ONLY listed IPs/ranges are allowed through that host. Leave empty (or scope to other hosts) to disable allowlisting elsewhere.</p>
+    <p class="hint">Use this for private hosts: when a rule applies, only its listed IPs or CIDRs may connect. Leave it empty for public hosts.</p>
     <table class="scoped-table" id="ip-allow-table">
       <thead><tr><th>IP or CIDR</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
       <tbody></tbody>
@@ -42,6 +42,7 @@
     <button data-add="ip-allow">Add allow rule</button>
 
     <h2>Blocklist</h2>
+    <p class="hint">Always deny these IPs or CIDRs. Add a host scope when the block should apply to only one site.</p>
     <table class="scoped-table" id="ip-block-table">
       <thead><tr><th>IP or CIDR</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
       <tbody></tbody>
@@ -51,7 +52,7 @@
 
   <section id="tab-ua" class="tab-panel">
     <h2>User-Agent blocklist</h2>
-    <p class="hint">Regex (case-insensitive prefix: <code>(?i)</code>). Matched against the request's <code>User-Agent</code> header. <strong>Except paths</strong> (comma-sep substrings) skip the rule when the request URI contains any of them — useful for letting bots fetch <code>/robots.txt</code> while blocking everything else.</p>
+    <p class="hint">Block known scanners by User-Agent regex. Use <code>(?i)</code> for case-insensitive matching; except paths apply only to the request path, such as <code>/robots.txt</code>.</p>
     <table class="scoped-table ua-table" id="ua-table">
       <thead><tr><th>Pattern</th><th>Hosts</th><th>Except paths</th><th></th></tr></thead>
       <tbody></tbody>
@@ -61,7 +62,7 @@
 
   <section id="tab-waf" class="tab-panel">
     <h2>WAF rules</h2>
-    <p class="hint">Go regex, matched against request URI, full URL, Cookie, and Referer.</p>
+    <p class="hint">Detect malicious text in the URL, Cookie, and Referer. Leave the recommended rules on, then add narrowly scoped rules for your app.</p>
     <table id="waf-table">
       <thead><tr><th>On</th><th>Name</th><th>Pattern</th><th>Hosts</th><th></th></tr></thead>
       <tbody></tbody>
@@ -74,12 +75,12 @@
     <label><input type="checkbox" id="rate-enabled"> Enabled</label>
     <label>Requests per minute <input type="number" id="rate-rpm" min="1" value="120"></label>
     <label>Burst <input type="number" id="rate-burst" min="1" value="30"></label>
-    <p class="hint">Limits each source IP globally across all hosts the plugin is assigned to.</p>
+    <p class="hint">Limits each source IP across protected hosts. The burst setting allows short spikes before requests are slowed down.</p>
   </section>
 
   <section id="tab-honeypot" class="tab-panel">
     <h2>Honeypot paths</h2>
-    <p class="hint">Any request whose URI matches one of these patterns triggers an immediate temporary ban on the source IP. Use literal paths (e.g. <code>/.env</code>) for prefix-substring matches, or include <code>*</code> for glob patterns. Bots probe these constantly — a perfect signal source.</p>
+    <p class="hint">Immediately ban requests for paths your sites never use, such as <code>/.env</code>. Review the list first; literal paths match the path only, and <code>*</code> adds a wildcard.</p>
     <label><input type="checkbox" id="honeypot-enabled"> Enabled</label>
     <label>Ban duration (seconds) <input type="number" id="honeypot-ban-secs" min="60" value="3600"></label>
     <table class="scoped-table" id="honeypot-table">
@@ -91,7 +92,7 @@
 
   <section id="tab-autoban" class="tab-panel">
     <h2>Auto-ban escalation</h2>
-    <p class="hint">After an IP triggers any block rule (UA, WAF, rate-limit, etc.) <code>Threshold</code> times within <code>Window</code> seconds, it's added to the temp-ban list for <code>Ban duration</code>. Honeypot hits already install temp bans directly.</p>
+    <p class="hint">Turn repeated rule hits into a temporary IP ban. Honeypot hits already ban immediately and do not need escalation.</p>
     <label><input type="checkbox" id="autoban-enabled"> Enabled</label>
     <label>Threshold (strikes) <input type="number" id="autoban-threshold" min="1" value="5"></label>
     <label>Window (seconds) <input type="number" id="autoban-window" min="1" value="60"></label>
@@ -100,7 +101,7 @@
 
   <section id="tab-fingerprint" class="tab-panel">
     <h2>Fingerprint tracking</h2>
-    <p class="hint">Track malicious actors across IP changes by fingerprinting User-Agent + Accept headers + HTTP version. When a fingerprint accumulates <code>Threshold</code> strikes within <code>Window</code> seconds, it's banned for <code>Ban duration</code>. Useful for detecting persistent attackers rotating IPs or using distributed scanners with identical tooling.</p>
+    <p class="hint">Link repeated blocked request signatures across IP changes. Enable only when you want stronger scanner detection and have reviewed the possible shared-client impact.</p>
     <label><input type="checkbox" id="fingerprint-enabled"> Enabled</label>
     <label>Threshold (strikes) <input type="number" id="fingerprint-threshold" min="1" value="10"></label>
     <label>Window (seconds) <input type="number" id="fingerprint-window" min="60" value="300"></label>
@@ -115,7 +116,7 @@
 
   <section id="tab-hostblock" class="tab-panel">
     <h2>Host header blocklist</h2>
-    <p class="hint">Regex matched against the request's <code>Host</code> header. Useful for rejecting traffic where someone is probing your Zoraxy IP with a bogus host (e.g. <code>Host: localhost</code>).</p>
+    <p class="hint">Reject requests with unwanted Host headers, such as origin-IP probes using <code>localhost</code>. Use a regex and keep it specific.</p>
     <table class="scoped-table" id="hostblock-table">
       <thead><tr><th>Regex</th><th>Hosts (apply scope; usually leave empty)</th><th></th></tr></thead>
       <tbody></tbody>
@@ -125,7 +126,7 @@
 
   <section id="tab-import" class="tab-panel">
     <h2>Import Cloudflare rule</h2>
-    <p class="hint">Paste a Cloudflare WAF / Custom Rule expression. Guardian translates the predicates it understands into honeypot paths, UA rules, host-header blocks, and WAF rules. Anything it can't translate (e.g. <code>cf.threat_score</code>, GeoIP, TLS fingerprints) is listed as a warning. Click <strong>Preview</strong> first, then <strong>Apply</strong> to merge into your live config.</p>
+    <p class="hint">Convert supported Cloudflare expressions into Guardian rules. Preview first; unsupported or unsafe grouped conditions are shown as warnings and are not applied.</p>
     <textarea id="import-cf-input" rows="10" placeholder='e.g. (http.request.uri.path contains "/.env") or (http.user_agent contains "Googlebot")'></textarea>
     <div style="display:flex;gap:8px;margin-top:8px;">
       <button id="import-cf-preview">Preview</button>
@@ -140,6 +141,7 @@
 
   <section id="tab-tempbans" class="tab-panel">
     <h2>Active temp bans <span class="count" id="tempbans-count"></span></h2>
+    <p class="hint">Review IPs currently blocked by honeypot or auto-ban rules. Clear a ban to restore access immediately.</p>
     <button id="tempbans-refresh">Refresh</button>
     <table id="tempbans-table">
       <thead><tr><th>IP</th><th>Expires</th><th></th></tr></thead>
@@ -150,7 +152,7 @@
   <section id="tab-general" class="tab-panel">
     <h2>General</h2>
     <label><input type="checkbox" id="trust-xff"> Trust X-Forwarded-For / X-Real-IP headers</label>
-    <p class="hint">Enable when Guardian is behind Zoraxy (the normal case). Disable only if you don't trust the upstream chain.</p>
+    <p class="hint">Enable only when your upstream proxy strips client-supplied forwarding headers and sets trusted client IPs.</p>
     <h2>Host pattern syntax</h2>
     <p class="hint">
       <code>example.com</code> — exact match.<br>
@@ -162,6 +164,7 @@
 
   <section id="tab-log" class="tab-panel">
     <h2>Block log <span class="count" id="log-count"></span></h2>
+    <p class="hint">Review recent blocks, search by IP or rule, and use the reason column to tune your policy.</p>
     <div class="log-controls">
       <input type="text" id="log-filter" placeholder="Filter (IP, host, reason, UA)…" />
       <button id="log-refresh">Refresh</button>

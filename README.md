@@ -12,8 +12,8 @@ A [Zoraxy](https://github.com/tobychui/zoraxy) plugin that adds an L7 security l
 Zoraxy ships with a built-in blacklist tied to access rules. Guardian extends that with the pieces a typical reverse proxy in front of public-facing apps needs:
 
 - Per-IP rate limiting with token-bucket bursts
-- Regex User-Agent blocking (default-ships scanner UAs: `sqlmap`, `nikto`, `nmap`, `masscan`, `acunetix`, `nessus`)
-- WAF-style request inspection (default rules for SQLi, XSS, path traversal, null bytes)
+- Regex User-Agent blocking (grouped defaults for network, web-vulnerability, and content-discovery scanners)
+- WAF-style request inspection (defaults for SQLi, XSS, command injection, Log4Shell, SSRF metadata probes, and path traversal)
 - Allowlist + blocklist with CIDR (IPv4 and IPv6) support
 - All four can be scoped to individual hosts via glob patterns
 
@@ -27,7 +27,7 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 |---|---|
 | **IP rules** | Allowlist + blocklist. CIDR (IPv4 + IPv6) and single IPs. |
 | **User-Agent blocklist** | Go regex (use `(?i)` for case-insensitive). |
-| **WAF rules** | Go regex over URI, full URL, Cookie, Referer. 7 default rules. |
+| **WAF rules** | Go regex over URI, full URL, Cookie, Referer. 10 consolidated default rules. |
 | **Rate limit** | Per-IP token bucket with automatic idle bucket eviction. |
 | **Honeypot paths** | Any request to a tripwire URL (e.g. `/.env`, `/wp-login.php`) installs a temp ban on the source IP. |
 | **Host-header blocklist** | Block by regex against the request's `Host` header — useful for rejecting probes that arrive with `Host: localhost` etc. |
@@ -117,23 +117,26 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 - *Allowlist semantics*: If at least one allow rule applies to the current host, **only** IPs matching one of the applicable rules pass through that host. Hosts where no allow rule applies are unaffected.
 - *Blocklist semantics*: Any IP/CIDR match denies the request.
 
-**User agents** — Regex blocklist. Default ships common scanner UAs.
+**User agents** — Regex blocklist. The three defaults group common network scanners, web-vulnerability scanners, and content-discovery tools so the list remains easy to review.
 
-**WAF rules** — Toggleable regex rules. Patterns match against `request_uri + " " + url + cookie + referer`. Default rules cover:
+**WAF rules** — Toggleable regex rules. Patterns match against `request_uri + " " + url + cookie + referer`. The defaults consolidate related signatures into a smaller, reviewable set:
 
 | Name | Catches |
 |---|---|
 | `sqli-union` | `UNION SELECT` injection variants |
-| `sqli-comment` | Comment-based SQLi (`--`, `#`, `/*`) combined with `OR`/`AND` |
-| `xss-script` | `<script>` tags |
-| `xss-javascript-uri` | `javascript:` URIs |
-| `xss-onevent` | `onerror=`, `onclick=`, etc. |
+| `sqli-boolean-comment` | Comment-based SQLi (`--`, `#`, `/*`) combined with `OR`/`AND` |
+| `sqli-time-based` | Time-delay SQLi (`sleep`, `benchmark`, `pg_sleep`) |
+| `xss-pattern` | `<script>` tags, `javascript:` URIs, and event handlers such as `onerror=` |
 | `path-traversal` | `../` and `..\` |
 | `null-byte` | `%00` |
+| `command-injection` | Shell chains followed by common execution/download tools |
+| `log4shell` | `${jndi:...}` payloads |
+| `dangerous-uri-scheme` | `php://`, `file://`, and `expect://` wrappers |
+| `ssrf-metadata` | Requests targeting common cloud metadata services |
 
 **Rate limit** — Per-IP token bucket. Configure requests/minute and burst. Buckets idle for >10 min are swept automatically; the map is hard-capped at 50k entries.
 
-**Honeypot** — A list of "tripwire" URL paths. Any request matching one of them adds the source IP to the temp-ban list for the configured duration. Ships with sensible defaults (`/.env`, `/.git/config`, `/wp-login.php`, `/phpmyadmin/`, etc.) and is OFF by default — turn it on once you've reviewed the path list.
+**Honeypot** — A list of "tripwire" URL paths. Any request matching one of them adds the source IP to the temp-ban list for the configured duration. Defaults cover exposed secrets, CMS/database probes, framework diagnostics, and known appliance paths. It is OFF by default — turn it on once you've reviewed the path list.
 
 **Auto-ban** — After an IP triggers any block rule `Threshold` times within `Window` seconds, it gets promoted to the temp-ban list for `Ban duration`. Honeypot hits install temp bans directly without strikes.
 

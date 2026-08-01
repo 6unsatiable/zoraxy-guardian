@@ -217,23 +217,25 @@ func mergeDefaults(c Config) Config {
 	}
 	if c.UABlocklist == nil {
 		c.UABlocklist = []ScopedEntry{
-			{Value: `(?i)sqlmap`},
-			{Value: `(?i)nikto`},
-			{Value: `(?i)nmap`},
-			{Value: `(?i)masscan`},
-			{Value: `(?i)acunetix`},
-			{Value: `(?i)nessus`},
+			// Keep scanner signatures grouped by purpose so the default policy
+			// is easier to review without sacrificing coverage.
+			{Value: `(?i)\b(nmap|masscan|zmap|zgrab|unicornscan)\b`},
+			{Value: `(?i)\b(sqlmap|nikto|acunetix|nessus|openvas|w3af|arachni|wapiti|nuclei)\b`},
+			{Value: `(?i)\b(dirbuster|gobuster|feroxbuster|ffuf|dirb|wfuzz|whatweb)\b`},
 		}
 	}
 	if c.WAFRules == nil {
 		c.WAFRules = []WAFRule{
 			{Name: "sqli-union", Pattern: `(?i)union[\s/*]+select`, Enabled: true},
-			{Name: "sqli-comment", Pattern: `(?i)(--|#|/\*).*(\bor\b|\band\b)`, Enabled: true},
-			{Name: "xss-script", Pattern: `(?i)<script\b`, Enabled: true},
-			{Name: "xss-javascript-uri", Pattern: `(?i)javascript:`, Enabled: true},
-			{Name: "xss-onevent", Pattern: `(?i)\bon\w+\s*=`, Enabled: true},
+			{Name: "sqli-boolean-comment", Pattern: `(?i)(--|#|/\*).*(\bor\b|\band\b)`, Enabled: true},
+			{Name: "sqli-time-based", Pattern: `(?i)\b(sleep|benchmark|pg_sleep)\s*\(`, Enabled: true},
+			{Name: "xss-pattern", Pattern: `(?i)(<script\b|javascript:|\bon\w+\s*=)`, Enabled: true},
 			{Name: "path-traversal", Pattern: `(\.\./|\.\.\\)`, Enabled: true},
-			{Name: "null-byte", Pattern: `%00`, Enabled: true},
+			{Name: "null-byte", Pattern: `(?i)%00`, Enabled: true},
+			{Name: "command-injection", Pattern: `(?i)(;|\|\||&&|%0a|%0d)(\s|%20)*(curl|wget|bash|sh|cmd|powershell|nc|netcat)\b`, Enabled: true},
+			{Name: "log4shell", Pattern: `(?i)\$\{jndi:[^}]+\}`, Enabled: true},
+			{Name: "dangerous-uri-scheme", Pattern: `(?i)(php|file|expect)://`, Enabled: true},
+			{Name: "ssrf-metadata", Pattern: `(?i)(169\.254\.169\.254|metadata\.google\.internal|metadata\.azure\.com|fd00:ec2::254)`, Enabled: true},
 		}
 	}
 	if c.RateLimit.RequestsPerMinute == 0 {
@@ -245,15 +247,25 @@ func mergeDefaults(c Config) Config {
 	if c.Honeypot.Paths == nil {
 		c.Honeypot.Paths = []ScopedEntry{
 			{Value: "/.env"},
-			{Value: "/.git/config"},
-			{Value: "/.git/HEAD"},
-			{Value: "/.aws/credentials"},
-			{Value: "/.ssh/id_rsa"},
+			{Value: "/.git/"},
+			{Value: "/.aws/"},
+			{Value: "/.ssh/"},
+			{Value: "/.docker/config.json"},
+			{Value: "/.kube/config"},
+			{Value: "/.npmrc"},
 			{Value: "/wp-login.php"},
 			{Value: "/wp-admin/setup-config.php"},
 			{Value: "/phpmyadmin/"},
+			{Value: "/adminer.php"},
 			{Value: "/admin/config.php"},
-			{Value: "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"},
+			{Value: "/vendor/phpunit/"},
+			{Value: "/actuator/env"},
+			{Value: "/actuator/heapdump"},
+			{Value: "/solr/admin/"},
+			{Value: "/manager/html"},
+			{Value: "/HNAP1/"},
+			{Value: "/boaform/"},
+			{Value: "/cgi-bin/"},
 		}
 	}
 	if c.Honeypot.BanSeconds == 0 {
