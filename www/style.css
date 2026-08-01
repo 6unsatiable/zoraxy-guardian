@@ -188,6 +188,10 @@ footer {
 #import-cf-msg { font-size: 12px; color: var(--text-muted); align-self: center; }
 #import-cf-msg.ok { color: var(--ok); }
 #import-cf-msg.err { color: var(--err); }
+.inline-actions { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+#rules-update-msg { font-size: 12px; color: var(--text-muted); }
+#rules-update-msg.ok { color: var(--ok); }
+#rules-update-msg.err { color: var(--err); }
 
 .src {
   display: inline-block;

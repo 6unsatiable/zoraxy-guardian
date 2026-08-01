@@ -151,8 +151,15 @@
 
   <section id="tab-general" class="tab-panel">
     <h2>General</h2>
-    <label><input type="checkbox" id="trust-xff"> Trust X-Forwarded-For / X-Real-IP headers</label>
-    <p class="hint">Enable only when your upstream proxy strips client-supplied forwarding headers and sets trusted client IPs.</p>
+    <label>Trusted proxy CIDRs <input type="text" id="trusted-proxy-cidrs" placeholder="172.17.0.0/16, 10.0.0.0/8"></label>
+    <p class="hint">Forwarded client-IP headers are used only when Zoraxy's direct peer matches one of these CIDRs. Leave empty if Zoraxy receives traffic directly.</p>
+    <h2>Recommended rule updates</h2>
+    <p class="hint">Preview or merge this release's UA, WAF, and honeypot rules. Your custom and host-scoped rules stay unchanged.</p>
+    <div class="inline-actions">
+      <button id="rules-update-preview">Preview</button>
+      <button id="rules-update-apply" class="primary">Merge recommended rules</button>
+      <span id="rules-update-msg"></span>
+    </div>
     <h2>Host pattern syntax</h2>
     <p class="hint">
       <code>example.com</code> — exact match.<br>
@@ -168,7 +175,10 @@
     <div class="log-controls">
       <input type="text" id="log-filter" placeholder="Filter (IP, host, reason, UA)…" />
       <button id="log-refresh">Refresh</button>
+      <button id="log-export-json">Export JSON</button>
+      <button id="log-export-csv">Export CSV</button>
     </div>
+    <p class="hint" id="log-summary"></p>
     <table id="log-table">
       <thead><tr><th>Time</th><th>Src</th><th>IP</th><th>Host</th><th>Method</th><th>URI</th><th>UA</th><th>Reason</th><th>Status</th></tr></thead>
       <tbody></tbody>

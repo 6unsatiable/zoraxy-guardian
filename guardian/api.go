@@ -1,6 +1,7 @@
 package guardian
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,12 +20,52 @@ func NewAPI(s *Store) *API { return &API{store: s} }
 func (a *API) RegisterRoutes(ui *plugin.PluginUiRouter, mux *http.ServeMux) {
 	ui.HandleFunc("/api/config", a.handleConfig, mux)
 	ui.HandleFunc("/api/blocklog", a.handleBlockLog, mux)
+	ui.HandleFunc("/api/blocklog/export", a.handleBlockLogExport, mux)
+	ui.HandleFunc("/api/blocklog/summary", a.handleBlockLogSummary, mux)
 	ui.HandleFunc("/api/blocklog/stream", a.handleBlockLogStream, mux)
 	ui.HandleFunc("/api/tempbans", a.handleTempBans, mux)
 	ui.HandleFunc("/api/tempbans/clear", a.handleTempBansClear, mux)
 	ui.HandleFunc("/api/fingerprintbans", a.handleFingerprintBans, mux)
 	ui.HandleFunc("/api/fingerprintbans/clear", a.handleFingerprintBansClear, mux)
 	ui.HandleFunc("/api/import/cf", a.handleImportCF, mux)
+	ui.HandleFunc("/api/rules/recommended", a.handleRecommendedRules, mux)
+}
+
+func (a *API) handleBlockLogSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.store.BlockLogSummary(5))
+}
+
+func (a *API) handleBlockLogExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	entries := a.store.LogPage(0, 0)
+	switch r.URL.Query().Get("format") {
+	case "json", "":
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", `attachment; filename="guardian-block-log.json"`)
+		_ = json.NewEncoder(w).Encode(entries)
+	case "csv":
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="guardian-block-log.csv"`)
+		writer := csv.NewWriter(w)
+		_ = writer.Write([]string{"time", "source", "ip", "fingerprint", "host", "method", "request_uri", "user_agent", "reason", "status"})
+		for _, entry := range entries {
+			_ = writer.Write([]string{
+				entry.Time.UTC().Format(time.RFC3339), entry.Source, entry.IP, entry.Fingerprint,
+				entry.Host, entry.Method, entry.RequestURI, entry.UserAgent, entry.Reason,
+				strconv.Itoa(entry.Status),
+			})
+		}
+		writer.Flush()
+	default:
+		http.Error(w, "format must be json or csv", http.StatusBadRequest)
+	}
 }
 
 func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -216,6 +257,35 @@ func (a *API) handleImportCF(w http.ResponseWriter, r *http.Request) {
 		"applied":  stats,
 		"warnings": parsed.Warnings,
 	})
+}
+
+// handleRecommendedRules previews or merges the defaults shipped with this
+// release. Existing custom and host-scoped rules are never overwritten.
+func (a *API) handleRecommendedRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Apply bool `json:"apply"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	cfg := a.store.Snapshot()
+	stats := MergeRecommendedRules(&cfg)
+	if !body.Apply {
+		writeJSON(w, http.StatusOK, map[string]any{"preview": stats})
+		return
+	}
+	if err := a.store.Update(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"applied": stats})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

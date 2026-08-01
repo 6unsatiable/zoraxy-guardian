@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,7 +37,7 @@ type Config struct {
 	Honeypot            Honeypot            `json:"honeypot"`
 	AutoBan             AutoBan             `json:"auto_ban"`
 	FingerprintTracking FingerprintTracking `json:"fingerprint_tracking"`
-	TrustXFF            bool                `json:"trust_xff"`
+	TrustedProxyCIDRs   []string            `json:"trusted_proxy_cidrs"`
 }
 
 type WAFRule struct {
@@ -133,6 +134,7 @@ type Store struct {
 	wafRules       []compiledRegexRule
 	wafRuleNames   []string
 	honeypotRules  []compiledGlobRule
+	trustedProxies []compiledIPRule
 	limiter        *rateLimiter
 	log            *blockLog
 	bcast          *broadcaster
@@ -201,6 +203,96 @@ func LoadState(configPath, logPath string) (*Store, error) {
 
 func defaultConfig() Config {
 	return mergeDefaults(Config{})
+}
+
+// RuleUpdateStats reports how a recommended-rule merge changed a
+// configuration. Custom rules are preserved; only unscoped legacy defaults
+// are replaced by their consolidated successors.
+type RuleUpdateStats struct {
+	UAAdded         int `json:"ua_added"`
+	UARemoved       int `json:"ua_removed"`
+	WAFAdded        int `json:"waf_added"`
+	WAFRemoved      int `json:"waf_removed"`
+	HoneypotAdded   int `json:"honeypot_added"`
+	HoneypotRemoved int `json:"honeypot_removed"`
+}
+
+// MergeRecommendedRules adds the current recommended rule sets to cfg. It is
+// intended for existing installs: user-created and host-scoped rules remain
+// untouched while the previous built-in defaults are consolidated.
+func MergeRecommendedRules(cfg *Config) RuleUpdateStats {
+	defaults := defaultConfig()
+	var stats RuleUpdateStats
+
+	stats.UARemoved = removeUnscopedEntries(&cfg.UABlocklist, []string{
+		`(?i)sqlmap`, `(?i)nikto`, `(?i)nmap`, `(?i)masscan`, `(?i)acunetix`, `(?i)nessus`,
+	})
+	stats.HoneypotRemoved = removeUnscopedEntries(&cfg.Honeypot.Paths, []string{
+		"/.git/config", "/.git/HEAD", "/.aws/credentials", "/.ssh/id_rsa",
+		"/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+	})
+	stats.WAFRemoved = removeLegacyWAFRules(&cfg.WAFRules)
+
+	stats.UAAdded = mergeScoped(&cfg.UABlocklist, defaults.UABlocklist)
+	stats.HoneypotAdded = mergeScoped(&cfg.Honeypot.Paths, defaults.Honeypot.Paths)
+	stats.WAFAdded = mergeRecommendedWAF(&cfg.WAFRules, defaults.WAFRules)
+	return stats
+}
+
+func removeUnscopedEntries(entries *[]ScopedEntry, values []string) int {
+	remove := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		remove[value] = struct{}{}
+	}
+	out := (*entries)[:0]
+	removed := 0
+	for _, entry := range *entries {
+		_, isLegacy := remove[entry.Value]
+		if isLegacy && len(entry.Hosts) == 0 && len(entry.ExceptPaths) == 0 {
+			removed++
+			continue
+		}
+		out = append(out, entry)
+	}
+	*entries = out
+	return removed
+}
+
+func removeLegacyWAFRules(rules *[]WAFRule) int {
+	legacy := map[string]string{
+		"sqli-comment":       `(?i)(--|#|/\*).*(\bor\b|\band\b)`,
+		"xss-script":         `(?i)<script\b`,
+		"xss-javascript-uri": `(?i)javascript:`,
+		"xss-onevent":        `(?i)\bon\w+\s*=`,
+	}
+	out := (*rules)[:0]
+	removed := 0
+	for _, rule := range *rules {
+		if pattern, ok := legacy[rule.Name]; ok && rule.Pattern == pattern && rule.Enabled && len(rule.Hosts) == 0 {
+			removed++
+			continue
+		}
+		out = append(out, rule)
+	}
+	*rules = out
+	return removed
+}
+
+func mergeRecommendedWAF(target *[]WAFRule, incoming []WAFRule) int {
+	seen := make(map[string]struct{}, len(*target))
+	for _, rule := range *target {
+		seen[rule.Pattern] = struct{}{}
+	}
+	added := 0
+	for _, rule := range incoming {
+		if _, ok := seen[rule.Pattern]; ok {
+			continue
+		}
+		*target = append(*target, rule)
+		seen[rule.Pattern] = struct{}{}
+		added++
+	}
+	return added
 }
 
 // mergeDefaults fills zero-value fields with sensible defaults. Used both
@@ -327,6 +419,15 @@ func (s *Store) compile() {
 	if s.cfg.RateLimit.Enabled {
 		s.limiter = newRateLimiter(s.cfg.RateLimit.RequestsPerMinute, s.cfg.RateLimit.Burst)
 	}
+	s.trustedProxies = compileIPRules(scopedEntries(s.cfg.TrustedProxyCIDRs))
+}
+
+func scopedEntries(values []string) []ScopedEntry {
+	entries := make([]ScopedEntry, 0, len(values))
+	for _, value := range values {
+		entries = append(entries, ScopedEntry{Value: value})
+	}
+	return entries
 }
 
 func compileIPRules(entries []ScopedEntry) []compiledIPRule {
@@ -409,6 +510,7 @@ func (s *Store) Snapshot() Config {
 	cfg.HostBlocklist = append([]ScopedEntry{}, s.cfg.HostBlocklist...)
 	cfg.WAFRules = append([]WAFRule{}, s.cfg.WAFRules...)
 	cfg.Honeypot.Paths = append([]ScopedEntry{}, s.cfg.Honeypot.Paths...)
+	cfg.TrustedProxyCIDRs = append([]string{}, s.cfg.TrustedProxyCIDRs...)
 	return cfg
 }
 
@@ -452,6 +554,9 @@ func validateConfig(cfg Config) error {
 	if err := validateRegexEntries("host blocklist", cfg.HostBlocklist); err != nil {
 		return err
 	}
+	if err := validateCIDRs("trusted proxy", cfg.TrustedProxyCIDRs); err != nil {
+		return err
+	}
 	for i, r := range cfg.WAFRules {
 		if r.Name == "" || r.Pattern == "" {
 			return fmt.Errorf("WAF rule %d must have a name and pattern", i+1)
@@ -471,6 +576,15 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.FingerprintTracking.Enabled && (cfg.FingerprintTracking.Threshold < 1 || cfg.FingerprintTracking.WindowSeconds < 1 || cfg.FingerprintTracking.BanSeconds < 1) {
 		return fmt.Errorf("fingerprint threshold, window, and duration must be positive")
+	}
+	return nil
+}
+
+func validateCIDRs(name string, values []string) error {
+	for i, value := range values {
+		if _, _, err := net.ParseCIDR(value); err != nil {
+			return fmt.Errorf("%s entry %d is not a valid CIDR", name, i+1)
+		}
 	}
 	return nil
 }
@@ -579,14 +693,14 @@ func (s *Store) TakeDecision(uuid string) (Decision, bool) {
 
 func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 	s.mu.RLock()
-	trust := s.cfg.TrustXFF
+	trustedProxies := s.trustedProxies
 	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	s.mu.RUnlock()
 
 	entry := BlockLogEntry{
 		Time:       time.Now().UTC(),
 		Source:     "guardian",
-		IP:         clientIP(req, trust),
+		IP:         clientIP(req, trustedProxies),
 		Host:       req.Host,
 		Method:     req.Method,
 		RequestURI: req.RequestURI,
@@ -600,14 +714,14 @@ func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 		entry.Fingerprint = GenerateFingerprint(req)
 	}
 
-	s.log.Append(entry)
-	s.bcast.publish(entry)
+	s.LogEntry(entry)
 }
 
 func (s *Store) LogEntry(entry BlockLogEntry) {
 	if entry.Time.IsZero() {
 		entry.Time = time.Now().UTC()
 	}
+	entry.RequestURI = redactRequestURI(entry.RequestURI)
 	s.log.Append(entry)
 	s.bcast.publish(entry)
 }
@@ -619,6 +733,7 @@ func (s *Store) LogPage(offset, limit int) []BlockLogEntry {
 	n := len(all)
 	rev := make([]BlockLogEntry, n)
 	for i, e := range all {
+		e.RequestURI = redactRequestURI(e.RequestURI)
 		rev[n-1-i] = e
 	}
 	// Offset and limit are ultimately supplied through query parameters.
@@ -649,6 +764,58 @@ func (s *Store) LogPage(offset, limit int) []BlockLogEntry {
 
 func (s *Store) LogTotal() int {
 	return len(s.log.Snapshot())
+}
+
+type BlockLogCount struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+type BlockLogSummary struct {
+	Total      int             `json:"total"`
+	TopIPs     []BlockLogCount `json:"top_ips"`
+	TopReasons []BlockLogCount `json:"top_reasons"`
+}
+
+// BlockLogSummary returns the most common client IPs and block reasons from
+// the in-memory log. Sorting makes the result stable for the UI and API.
+func (s *Store) BlockLogSummary(limit int) BlockLogSummary {
+	if limit < 1 {
+		limit = 5
+	}
+	entries := s.log.Snapshot()
+	ips := make(map[string]int)
+	reasons := make(map[string]int)
+	for _, entry := range entries {
+		if entry.IP != "" {
+			ips[entry.IP]++
+		}
+		if entry.Reason != "" {
+			reasons[entry.Reason]++
+		}
+	}
+	return BlockLogSummary{
+		Total:      len(entries),
+		TopIPs:     sortedLogCounts(ips, limit),
+		TopReasons: sortedLogCounts(reasons, limit),
+	}
+}
+
+func sortedLogCounts(counts map[string]int, limit int) []BlockLogCount {
+	items := make([]BlockLogCount, 0, len(counts))
+	for value, count := range counts {
+		items = append(items, BlockLogCount{Value: value, Count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count == items[j].Count {
+			return items[i].Value < items[j].Value
+		}
+		return items[i].Count > items[j].Count
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items
 }
 
 // Broadcaster returns the underlying log broadcaster for SSE subscribers.

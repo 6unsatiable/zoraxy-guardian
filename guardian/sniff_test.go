@@ -165,34 +165,30 @@ func TestRateLimitDecision(t *testing.T) {
 	}
 }
 
-func TestTrustXFFToggle(t *testing.T) {
+func TestTrustedProxyUsesForwardedClientIP(t *testing.T) {
 	s := newStore(t, Config{
-		IPBlocklist: []ScopedEntry{{Value: "9.9.9.9"}},
-		TrustXFF:    true,
+		IPBlocklist:       []ScopedEntry{{Value: "9.9.9.9"}},
+		TrustedProxyCIDRs: []string{"203.0.113.0/24"},
 	})
-	r := req("x.test", "127.0.0.1", "ua", "/")
-	r.Header["X-Forwarded-For"] = []string{"9.9.9.9, 10.0.0.1"}
-	if d := s.Evaluate(r); !d.Block {
-		t.Errorf("expected XFF client to be blocked when trusted, got %+v", d)
+	r := req("x.test", "203.0.113.10", "ua", "/")
+	r.Header["X-Forwarded-For"] = []string{"9.9.9.9, 203.0.113.11"}
+	if d := s.Evaluate(r); !d.Block || d.Reason != "ip-blocklist" {
+		t.Errorf("expected forwarded client to be blocked through trusted proxy, got %+v", d)
 	}
 
-	s2 := newStore(t, Config{
-		IPBlocklist: []ScopedEntry{{Value: "9.9.9.9"}},
-		TrustXFF:    false,
-	})
-	r2 := req("x.test", "127.0.0.1", "ua", "/")
-	r2.Header["X-Forwarded-For"] = []string{"9.9.9.9"}
-	if d := s2.Evaluate(r2); d.Block {
-		t.Errorf("XFF must not be honored when distrusted, got %+v", d)
+	direct := req("x.test", "198.51.100.10", "ua", "/")
+	direct.Header["X-Forwarded-For"] = []string{"9.9.9.9"}
+	if d := s.Evaluate(direct); d.Block {
+		t.Errorf("client-supplied XFF must not be honored from an untrusted peer, got %+v", d)
 	}
 }
 
 func TestMalformedForwardingHeadersFallBackToRemoteAddress(t *testing.T) {
 	s := newStore(t, Config{
-		IPBlocklist: []ScopedEntry{{Value: "127.0.0.1"}},
-		TrustXFF:    true,
+		IPBlocklist:       []ScopedEntry{{Value: "203.0.113.10"}},
+		TrustedProxyCIDRs: []string{"203.0.113.0/24"},
 	})
-	r := req("x.test", "127.0.0.1", "ua", "/")
+	r := req("x.test", "203.0.113.10", "ua", "/")
 	r.Header["X-Forwarded-For"] = []string{"not-an-ip"}
 	r.Header["X-Real-IP"] = []string{"also-not-an-ip"}
 	if d := s.Evaluate(r); !d.Block || d.Reason != "ip-blocklist" {

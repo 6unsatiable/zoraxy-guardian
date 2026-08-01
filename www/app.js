@@ -109,7 +109,7 @@
     $('#fingerprint-threshold').value = c.fingerprint_tracking?.threshold ?? 10;
     $('#fingerprint-window').value = c.fingerprint_tracking?.window_seconds ?? 300;
     $('#fingerprint-ban-secs').value = c.fingerprint_tracking?.ban_seconds ?? 3600;
-    $('#trust-xff').checked = !!c.trust_xff;
+    $('#trusted-proxy-cidrs').value = hostsToStr(c.trusted_proxy_cidrs);
   }
 
   function collectUI() {
@@ -152,7 +152,7 @@
         window_seconds: parseInt($('#fingerprint-window').value, 10) || 300,
         ban_seconds: parseInt($('#fingerprint-ban-secs').value, 10) || 3600,
       },
-      trust_xff: $('#trust-xff').checked,
+      trusted_proxy_cidrs: strToHosts($('#trusted-proxy-cidrs').value) || [],
     };
   }
 
@@ -216,6 +216,28 @@
       logState.entries = data.entries;
     }
     renderLog();
+  }
+
+  function formatCounts(items) {
+    return (items || []).map((item) => `${item.value} (${item.count})`).join(' · ') || 'none';
+  }
+
+  async function fetchLogSummary() {
+    const r = await fetch('./api/blocklog/summary', { headers: { 'X-CSRF-Token': csrfToken } });
+    if (!r.ok) return;
+    const data = await r.json();
+    $('#log-summary').textContent = `Top IPs: ${formatCounts(data.top_ips)} | Top rules: ${formatCounts(data.top_reasons)}`;
+  }
+
+  async function exportBlockLog(format) {
+    const r = await fetch(`./api/blocklog/export?format=${format}`, { headers: { 'X-CSRF-Token': csrfToken } });
+    if (!r.ok) { setStatus('Log export failed: ' + r.status, true); return; }
+    const url = URL.createObjectURL(await r.blob());
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `guardian-block-log.${format}`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   function connectLogStream() {
@@ -300,7 +322,7 @@
     $$('.tab-panel').forEach((x) => x.classList.remove('active'));
     t.classList.add('active');
     $('#tab-' + t.dataset.tab).classList.add('active');
-    if (t.dataset.tab === 'log') fetchLogPage(false);
+    if (t.dataset.tab === 'log') { fetchLogPage(false); fetchLogSummary(); }
     if (t.dataset.tab === 'tempbans') fetchTempBans();
     if (t.dataset.tab === 'fingerprint') fetchFingerprintBans();
   }));
@@ -342,6 +364,8 @@
   $('#save').addEventListener('click', saveConfig);
   $('#reload').addEventListener('click', fetchConfig);
   $('#log-refresh').addEventListener('click', () => fetchLogPage(false));
+  $('#log-export-json').addEventListener('click', () => exportBlockLog('json'));
+  $('#log-export-csv').addEventListener('click', () => exportBlockLog('csv'));
   $('#log-older').addEventListener('click', () => fetchLogPage(true));
   $('#log-filter').addEventListener('input', (e) => { logState.filter = e.target.value; renderLog(); });
   $('#tempbans-refresh').addEventListener('click', fetchTempBans);
@@ -387,6 +411,29 @@
   }
   $('#import-cf-preview').addEventListener('click', () => importCF(false));
   $('#import-cf-apply').addEventListener('click', () => importCF(true));
+
+  async function updateRecommendedRules(apply) {
+    const msg = $('#rules-update-msg');
+    msg.className = '';
+    msg.textContent = '';
+    const r = await fetch('./api/rules/recommended', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ apply }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      msg.textContent = data.error || ('error ' + r.status);
+      msg.className = 'err';
+      return;
+    }
+    const s = data.applied || data.preview || {};
+    msg.textContent = `${apply ? 'merged' : 'preview'}: UA +${s.ua_added || 0}/−${s.ua_removed || 0}, WAF +${s.waf_added || 0}/−${s.waf_removed || 0}, honeypot +${s.honeypot_added || 0}/−${s.honeypot_removed || 0}`;
+    msg.className = 'ok';
+    if (apply) fetchConfig();
+  }
+  $('#rules-update-preview').addEventListener('click', () => updateRecommendedRules(false));
+  $('#rules-update-apply').addEventListener('click', () => updateRecommendedRules(true));
 
   fetchConfig();
   connectLogStream();

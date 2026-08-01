@@ -35,9 +35,9 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 | **Cloudflare rule import** | Paste a Cloudflare WAF / Custom Rule expression and Guardian translates it into the right primitives. Handles path/query/UA/host predicates with AND/OR/NOT, multi-clause expressions, and the `path ne X and (...)` exemption pattern. |
 | **Auto-ban escalation** | After N strikes in a sliding window, the IP gets a temp ban — escalates noisy scanners from per-rule blocks to a wholesale ban. |
 | **Per-host scopes** | Each rule has an optional host glob filter — `*.api.test`, `**.example.com`, `*`, or exact. |
-| **Live block log** | Last 500 events kept in memory; mirrored to JSONL on disk with fsync; restored on restart; auto-rotates at 5 MiB. Paginated UI with live SSE updates. |
+| **Live block log** | Last 500 events kept in memory; mirrored to JSONL on disk with fsync; restored on restart; auto-rotates at 5 MiB. Sensitive query values are redacted; the UI includes live updates, top counts, and JSON/CSV exports. |
 | **Zoraxy event subscription** | Mirrors Zoraxy's own `blacklistedIpBlocked` events into Guardian's log. |
-| **XFF awareness** | Respects `X-Forwarded-For`/`X-Real-IP` from Zoraxy by default. Toggle in UI. |
+| **Trusted proxies** | Honors `X-Forwarded-For`/`X-Real-IP` only when Zoraxy's direct peer is in a configured trusted-proxy CIDR. |
 | **Dark mode** | Light / dark theme toggle, persisted in localStorage; defaults to system preference. |
 | **No external services** | Single ~6 MB Go binary. Embedded UI. No DB, no Redis. |
 
@@ -158,9 +158,9 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 
 Anything else (e.g. `cf.threat_score`, `ip.geoip.country`, `ssl`, method/header subfields) is reported as a warning rather than translated.
 
-**General** — Trust-XFF toggle and host pattern reference.
+**General** — Configure the CIDRs of proxies directly in front of Zoraxy. Forwarding headers are ignored for all other peers, preventing client-IP spoofing. This tab also previews or merges the current recommended UA, WAF, and honeypot rules without replacing custom or host-scoped rules.
 
-**Block log** — Recent block events with source (`guardian` vs `zoraxy`), reason, status code. Paginated 50 at a time with a free-text filter. New blocks appear live via Server-Sent Events (the green/red dot in the header reflects connection status).
+**Block log** — Recent block events with source (`guardian` vs `zoraxy`), reason, and status code. Paginated 50 at a time with a free-text filter, top IP/rule counts, and JSON/CSV exports. New blocks appear live via Server-Sent Events (the green/red dot in the header reflects connection status). Values for common credential query keys are redacted before logging.
 
 ### Host pattern syntax
 
@@ -306,7 +306,7 @@ Static IP block rules are evaluated first; rate-limit is last. If a scanner is m
 
 ### Guardian sees my IP as Zoraxy's loopback
 
-Make sure **Trust X-Forwarded-For** is on in the General tab. Disable only if you have an untrusted hop between the client and Zoraxy.
+In **General**, add the CIDR of the proxy or Docker network directly connected to Zoraxy, such as `172.17.0.0/16`. Guardian then trusts forwarding headers only from that peer range and picks the rightmost untrusted address from `X-Forwarded-For`. Never add a public client range just to make this work.
 
 ---
 

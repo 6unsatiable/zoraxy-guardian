@@ -30,7 +30,7 @@ import (
 func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	s.mu.RLock()
 	host := req.Host
-	trust := s.cfg.TrustXFF
+	trustedProxies := s.trustedProxies
 	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	honeypotEnabled := s.cfg.Honeypot.Enabled
 	honeypotBanSecs := s.cfg.Honeypot.BanSeconds
@@ -44,7 +44,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	limiter := s.limiter
 	s.mu.RUnlock()
 
-	ip := clientIP(req, trust)
+	ip := clientIP(req, trustedProxies)
 	parsedIP := net.ParseIP(ip)
 
 	// Generate fingerprint for cross-IP tracking
@@ -231,28 +231,57 @@ func wafCheck(req *plugin.DynamicSniffForwardRequest, host string, rules []compi
 	return ""
 }
 
-func clientIP(req *plugin.DynamicSniffForwardRequest, trustXFF bool) string {
-	if trustXFF {
-		if xff := firstHeader(req.Header, "X-Forwarded-For"); xff != "" {
-			parts := strings.Split(xff, ",")
-			if ip := net.ParseIP(strings.TrimSpace(parts[0])); ip != nil {
-				return ip.String()
+// clientIP returns the direct peer unless that peer belongs to a configured
+// trusted-proxy CIDR. When the peer is trusted, X-Forwarded-For is walked from
+// right to left and the first untrusted address is selected. This prevents a
+// client from spoofing its address by supplying forwarding headers directly.
+func clientIP(req *plugin.DynamicSniffForwardRequest, trustedProxies []compiledIPRule) string {
+	remote := remoteIP(req.RemoteAddr)
+	if remote == nil {
+		return req.RemoteAddr
+	}
+	if !ipInRules(remote, trustedProxies) {
+		return remote.String()
+	}
+
+	if xff := firstHeader(req.Header, "X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		chain := make([]net.IP, 0, len(parts))
+		for _, part := range parts {
+			ip := net.ParseIP(strings.TrimSpace(part))
+			if ip == nil {
+				return remote.String()
+			}
+			chain = append(chain, ip)
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			if !ipInRules(chain[i], trustedProxies) {
+				return chain[i].String()
 			}
 		}
-		if xri := firstHeader(req.Header, "X-Real-IP"); xri != "" {
-			if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
-				return ip.String()
-			}
+	}
+	if xri := firstHeader(req.Header, "X-Real-IP"); xri != "" {
+		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
+			return ip.String()
 		}
 	}
-	host, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err == nil {
-		return host
+	return remote.String()
+}
+
+func remoteIP(addr string) net.IP {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return net.ParseIP(host)
 	}
-	if ip := net.ParseIP(strings.TrimSpace(req.RemoteAddr)); ip != nil {
-		return ip.String()
+	return net.ParseIP(strings.TrimSpace(addr))
+}
+
+func ipInRules(ip net.IP, rules []compiledIPRule) bool {
+	for _, rule := range rules {
+		if rule.Net.Contains(ip) {
+			return true
+		}
 	}
-	return req.RemoteAddr
+	return false
 }
 
 func firstHeader(h map[string][]string, name string) string {
