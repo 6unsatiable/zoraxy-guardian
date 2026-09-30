@@ -6,7 +6,7 @@
 
   let cfg = null;
   const PAGE_SIZE = 50;
-  let logState = { entries: [], total: 0, offset: 0, filter: '', sse: null };
+  let logState = { entries: [], total: 0, offset: 0, filter: '', source: '', sse: null };
 
   // ---------- theme ----------
   const THEME_KEY = 'guardian.theme';
@@ -110,6 +110,8 @@
     $('#fingerprint-window').value = c.fingerprint_tracking?.window_seconds ?? 300;
     $('#fingerprint-ban-secs').value = c.fingerprint_tracking?.ban_seconds ?? 3600;
     $('#trusted-proxy-cidrs').value = hostsToStr(c.trusted_proxy_cidrs);
+    $('#trust-cloudflare').checked = !!c.trust_cloudflare;
+    $('#ignore-zoraxy-blacklist').checked = !!c.ignore_zoraxy_blacklist;
   }
 
   function collectUI() {
@@ -153,6 +155,8 @@
         ban_seconds: parseInt($('#fingerprint-ban-secs').value, 10) || 3600,
       },
       trusted_proxy_cidrs: strToHosts($('#trusted-proxy-cidrs').value) || [],
+      trust_cloudflare: $('#trust-cloudflare').checked,
+      ignore_zoraxy_blacklist: $('#ignore-zoraxy-blacklist').checked,
     };
   }
 
@@ -172,9 +176,32 @@
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
       body: JSON.stringify(body),
     });
-    if (!r.ok) { setStatus('Save failed: ' + r.status, true); return; }
+    if (!r.ok) {
+      // The server explains validation failures (e.g. which rule has a bad regex).
+      const detail = (await r.text().catch(() => '')).trim();
+      setStatus('Save failed: ' + (detail || r.status), true);
+      return;
+    }
+    // Reload what the server actually stored (defaults get filled in there).
+    await fetchConfig();
     setStatus('Saved');
-    applyToUI(body);
+    fetchStatus();
+  }
+
+  // ---------- health banner ----------
+  async function fetchStatus() {
+    const r = await fetch('./api/status', { headers: { 'X-CSRF-Token': csrfToken } });
+    if (!r.ok) return;
+    const st = await r.json();
+    const banner = $('#proxy-banner');
+    const p = st.untrusted_proxy || {};
+    if (p.count > 0 && !$('#trust-cloudflare').checked) {
+      banner.textContent = `${p.count} request(s) since the plugin started came from a proxy address (last: ${p.last_ip} for ${p.last_host}), so Guardian could not see the real visitor. `
+        + 'Those requests can still be blocked, but no bans or rate limits are applied to the proxy. Fix: General → "Trust Cloudflare", or add the proxy to Trusted proxy CIDRs.';
+      banner.hidden = false;
+    } else {
+      banner.hidden = true;
+    }
   }
 
   // ---------- block log: paginated + SSE-live ----------
@@ -204,7 +231,8 @@
 
   async function fetchLogPage(append) {
     const offset = append ? logState.entries.length : 0;
-    const r = await fetch(`./api/blocklog?offset=${offset}&limit=${PAGE_SIZE}`, {
+    const src = logState.source ? `&source=${logState.source}` : '';
+    const r = await fetch(`./api/blocklog?offset=${offset}&limit=${PAGE_SIZE}${src}`, {
       headers: { 'X-CSRF-Token': csrfToken },
     });
     if (!r.ok) return;
@@ -223,14 +251,16 @@
   }
 
   async function fetchLogSummary() {
-    const r = await fetch('./api/blocklog/summary', { headers: { 'X-CSRF-Token': csrfToken } });
+    const src = logState.source ? `?source=${logState.source}` : '';
+    const r = await fetch(`./api/blocklog/summary${src}`, { headers: { 'X-CSRF-Token': csrfToken } });
     if (!r.ok) return;
     const data = await r.json();
     $('#log-summary').textContent = `Top IPs: ${formatCounts(data.top_ips)} | Top rules: ${formatCounts(data.top_reasons)}`;
   }
 
   async function exportBlockLog(format) {
-    const r = await fetch(`./api/blocklog/export?format=${format}`, { headers: { 'X-CSRF-Token': csrfToken } });
+    const src = logState.source ? `&source=${logState.source}` : '';
+    const r = await fetch(`./api/blocklog/export?format=${format}${src}`, { headers: { 'X-CSRF-Token': csrfToken } });
     if (!r.ok) { setStatus('Log export failed: ' + r.status, true); return; }
     const url = URL.createObjectURL(await r.blob());
     const link = document.createElement('a');
@@ -250,9 +280,12 @@
       es.addEventListener('block', (ev) => {
         try {
           const entry = JSON.parse(ev.data);
+          if (logState.source && (entry.source || 'guardian') !== logState.source) return;
           entry.__fresh = true;
           logState.entries.unshift(entry);
-          logState.total += 1;
+          // The server keeps the newest 2000; don't let a long-open tab grow forever.
+          if (logState.entries.length > 2000) logState.entries.length = 2000;
+          logState.total = Math.min(logState.total + 1, 2000);
           renderLog();
         } catch (_) { /* ignore */ }
       });
@@ -368,6 +401,7 @@
   $('#log-export-csv').addEventListener('click', () => exportBlockLog('csv'));
   $('#log-older').addEventListener('click', () => fetchLogPage(true));
   $('#log-filter').addEventListener('input', (e) => { logState.filter = e.target.value; renderLog(); });
+  $('#log-source').addEventListener('change', (e) => { logState.source = e.target.value; fetchLogPage(false); fetchLogSummary(); });
   $('#tempbans-refresh').addEventListener('click', fetchTempBans);
 
   // ---------- Cloudflare import ----------
@@ -435,6 +469,7 @@
   $('#rules-update-preview').addEventListener('click', () => updateRecommendedRules(false));
   $('#rules-update-apply').addEventListener('click', () => updateRecommendedRules(true));
 
-  fetchConfig();
+  fetchConfig().then(fetchStatus);
+  setInterval(fetchStatus, 60000);
   connectLogStream();
 })();

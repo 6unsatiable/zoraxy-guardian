@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,12 @@ type Config struct {
 	AutoBan             AutoBan             `json:"auto_ban"`
 	FingerprintTracking FingerprintTracking `json:"fingerprint_tracking"`
 	TrustedProxyCIDRs   []string            `json:"trusted_proxy_cidrs"`
+	// TrustCloudflare adds Cloudflare's published edge ranges to the trusted
+	// proxies and honors CF-Connecting-IP from them.
+	TrustCloudflare bool `json:"trust_cloudflare"`
+	// IgnoreZoraxyBlacklist stops mirroring Zoraxy's own blacklist/geo hits
+	// into the block log (they can drown out Guardian's own blocks).
+	IgnoreZoraxyBlacklist bool `json:"ignore_zoraxy_blacklist"`
 }
 
 type WAFRule struct {
@@ -142,8 +149,19 @@ type Store struct {
 	pendingMu sync.Mutex
 	pending   map[string]pendingDecision
 
+	// Traffic that resolved to a proxy address (see isProxyAddress).
+	proxyMu      sync.Mutex
+	proxyWarning ProxyWarning
+
+	// Repeat temp-ban/fingerprint-ban log entries are throttled per key.
+	logThrottleMu sync.Mutex
+	logThrottle   map[string]time.Time
+	suppressed    int64
+
 	// Temporary bans + strike tracking (separate mutex; hot path).
 	banMu              sync.Mutex
+	bansPath           string
+	bansDirty          bool
 	tempBans           map[string]time.Time   // IP -> expiry
 	strikes            map[string][]time.Time // IP -> recent strike timestamps
 	fingerprintBans    map[string]time.Time   // Fingerprint -> expiry
@@ -153,7 +171,29 @@ type Store struct {
 const (
 	maxPendingDecisions = 10000
 	pendingDecisionTTL  = 2 * time.Minute
+	// Upper bound for each ban/strike map, so a botnet cycling through
+	// addresses can't grow memory without limit.
+	maxTrackedKeys = 100000
+	// A banned client keeps knocking; log it at most once per window.
+	repeatLogWindow = time.Minute
 )
+
+// ProxyWarning describes traffic whose client address resolved to a proxy
+// (Cloudflare or a trusted proxy), which means forwarding headers were not
+// trusted for it. Surfaced in the UI so the misconfiguration gets fixed.
+type ProxyWarning struct {
+	Count    int64     `json:"count"`
+	LastIP   string    `json:"last_ip,omitempty"`
+	LastHost string    `json:"last_host,omitempty"`
+	LastSeen time.Time `json:"last_seen,omitempty"`
+}
+
+// ValidationError marks a config the user must fix (HTTP 400), as opposed
+// to a failure to save it (HTTP 500).
+type ValidationError struct{ Err error }
+
+func (e *ValidationError) Error() string { return e.Err.Error() }
+func (e *ValidationError) Unwrap() error { return e.Err }
 
 type pendingDecision struct {
 	decision Decision
@@ -164,6 +204,7 @@ type Decision struct {
 	Block  bool
 	Reason string
 	Status int
+	IP     string // resolved client address the decision was made for
 }
 
 func LoadState(configPath, logPath string) (*Store, error) {
@@ -175,6 +216,8 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		strikes:            make(map[string][]time.Time),
 		fingerprintBans:    make(map[string]time.Time),
 		fingerprintStrikes: make(map[string][]time.Time),
+		logThrottle:        make(map[string]time.Time),
+		bansPath:           filepath.Join(filepath.Dir(configPath), "bans.json"),
 		bcast:              newBroadcaster(),
 	}
 	data, err := os.ReadFile(configPath)
@@ -197,6 +240,7 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		return nil, err
 	}
 	s.log = log
+	s.loadBans()
 	go s.banSweepLoop()
 	return s, nil
 }
@@ -264,6 +308,7 @@ func removeLegacyWAFRules(rules *[]WAFRule) int {
 		"xss-script":         `(?i)<script\b`,
 		"xss-javascript-uri": `(?i)javascript:`,
 		"xss-onevent":        `(?i)\bon\w+\s*=`,
+		"null-byte":          `%00`, // superseded by the case-insensitive `(?i)%00`
 	}
 	out := (*rules)[:0]
 	removed := 0
@@ -420,6 +465,9 @@ func (s *Store) compile() {
 		s.limiter = newRateLimiter(s.cfg.RateLimit.RequestsPerMinute, s.cfg.RateLimit.Burst)
 	}
 	s.trustedProxies = compileIPRules(scopedEntries(s.cfg.TrustedProxyCIDRs))
+	if s.cfg.TrustCloudflare {
+		s.trustedProxies = append(s.trustedProxies, cloudflareRules...)
+	}
 }
 
 func scopedEntries(values []string) []ScopedEntry {
@@ -474,9 +522,11 @@ func compileUARules(entries []ScopedEntry) []compiledUARule {
 	return out
 }
 
-// compileGlobRules accepts path patterns: either a literal prefix (matches
-// anywhere in the request URI) or a path containing `*` which is converted
-// to regex (where `*` matches anything except `/`).
+// compileGlobRules compiles honeypot paths, case-insensitively (scanners
+// vary case and most app servers don't care). A value without wildcards
+// matches anywhere in the request path as a literal, so "/.env" catches
+// "/api/.env" too. A value with wildcards must match the whole path: `*` and
+// `?` stay within one path segment, `**` crosses segments.
 func compileGlobRules(entries []ScopedEntry) []compiledGlobRule {
 	out := make([]compiledGlobRule, 0, len(entries))
 	for _, e := range entries {
@@ -486,11 +536,10 @@ func compileGlobRules(entries []ScopedEntry) []compiledGlobRule {
 		}
 		var re *regexp.Regexp
 		var err error
-		if !regexp.MustCompile(`[*?]`).MatchString(val) {
-			// Plain prefix: match anywhere in the URI as a literal.
-			re = regexp.MustCompile(regexp.QuoteMeta(val))
+		if !strings.ContainsAny(val, "*?") {
+			re = regexp.MustCompile("(?i)" + regexp.QuoteMeta(val))
 		} else {
-			re, err = regexp.Compile(globToRegex(val))
+			re, err = regexp.Compile("(?i)" + pathGlobToRegex(val))
 			if err != nil {
 				continue
 			}
@@ -498,6 +547,28 @@ func compileGlobRules(entries []ScopedEntry) []compiledGlobRule {
 		out = append(out, compiledGlobRule{RE: re, Hosts: e.Hosts})
 	}
 	return out
+}
+
+func pathGlobToRegex(p string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(p); i++ {
+		switch c := p[i]; c {
+		case '*':
+			if i+1 < len(p) && p[i+1] == '*' {
+				b.WriteString(".*")
+				i++
+				continue
+			}
+			b.WriteString("[^/]*")
+		case '?':
+			b.WriteString("[^/]")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(c)))
+		}
+	}
+	b.WriteString("$")
+	return b.String()
 }
 
 func (s *Store) Snapshot() Config {
@@ -517,7 +588,7 @@ func (s *Store) Snapshot() Config {
 func (s *Store) Update(cfg Config) error {
 	cfg = mergeDefaults(cfg)
 	if err := validateConfig(cfg); err != nil {
-		return err
+		return &ValidationError{Err: err}
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -697,10 +768,14 @@ func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	s.mu.RUnlock()
 
+	ip := d.IP
+	if ip == "" {
+		ip = clientIP(req, trustedProxies)
+	}
 	entry := BlockLogEntry{
 		Time:       time.Now().UTC(),
 		Source:     "guardian",
-		IP:         clientIP(req, trustedProxies),
+		IP:         ip,
 		Host:       req.Host,
 		Method:     req.Method,
 		RequestURI: req.RequestURI,
@@ -714,10 +789,73 @@ func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 		entry.Fingerprint = GenerateFingerprint(req)
 	}
 
+	// An already-banned client keeps retrying; one entry per minute is enough
+	// (and keeps a flood from flushing the useful history out of the log).
+	switch d.Reason {
+	case "temp-ban":
+		if !s.shouldLogRepeat("ip:" + banKey(ip)) {
+			return
+		}
+	case "fingerprint-ban":
+		if !s.shouldLogRepeat("fp:" + entry.Fingerprint) {
+			return
+		}
+	}
+
 	s.LogEntry(entry)
 }
 
+func (s *Store) shouldLogRepeat(key string) bool {
+	now := time.Now()
+	s.logThrottleMu.Lock()
+	defer s.logThrottleMu.Unlock()
+	if last, ok := s.logThrottle[key]; ok && now.Sub(last) < repeatLogWindow {
+		s.suppressed++
+		return false
+	}
+	if len(s.logThrottle) >= maxTrackedKeys {
+		for k, t := range s.logThrottle {
+			if now.Sub(t) >= repeatLogWindow {
+				delete(s.logThrottle, k)
+			}
+		}
+	}
+	s.logThrottle[key] = now
+	return true
+}
+
+// SuppressedRepeats is how many repeat ban hits were not logged.
+func (s *Store) SuppressedRepeats() int64 {
+	s.logThrottleMu.Lock()
+	defer s.logThrottleMu.Unlock()
+	return s.suppressed
+}
+
+func (s *Store) noteUntrustedProxy(ip, host string) {
+	s.proxyMu.Lock()
+	s.proxyWarning.Count++
+	s.proxyWarning.LastIP = ip
+	s.proxyWarning.LastHost = normalizeHost(host)
+	s.proxyWarning.LastSeen = time.Now().UTC()
+	s.proxyMu.Unlock()
+}
+
+// ProxyWarningSnapshot returns the untrusted-proxy counter.
+func (s *Store) ProxyWarningSnapshot() ProxyWarning {
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	return s.proxyWarning
+}
+
 func (s *Store) LogEntry(entry BlockLogEntry) {
+	if entry.Source == "zoraxy" && entry.Reason == "zoraxy-blacklist" {
+		s.mu.RLock()
+		ignore := s.cfg.IgnoreZoraxyBlacklist
+		s.mu.RUnlock()
+		if ignore {
+			return
+		}
+	}
 	if entry.Time.IsZero() {
 		entry.Time = time.Now().UTC()
 	}
@@ -728,7 +866,13 @@ func (s *Store) LogEntry(entry BlockLogEntry) {
 
 // LogPage returns blocklog entries newest-first, paginated.
 func (s *Store) LogPage(offset, limit int) []BlockLogEntry {
-	all := s.log.Snapshot()
+	return s.LogPageSource("", offset, limit)
+}
+
+// LogPageSource is LogPage restricted to one source ("guardian" or
+// "zoraxy"); an empty source returns everything.
+func (s *Store) LogPageSource(source string, offset, limit int) []BlockLogEntry {
+	all := filterSource(s.log.Snapshot(), source)
 	// Reverse: ring is oldest-first; UI wants newest-first.
 	n := len(all)
 	rev := make([]BlockLogEntry, n)
@@ -766,6 +910,24 @@ func (s *Store) LogTotal() int {
 	return len(s.log.Snapshot())
 }
 
+// LogTotalSource counts entries from one source ("" = all).
+func (s *Store) LogTotalSource(source string) int {
+	return len(filterSource(s.log.Snapshot(), source))
+}
+
+func filterSource(entries []BlockLogEntry, source string) []BlockLogEntry {
+	if source == "" {
+		return entries
+	}
+	out := entries[:0]
+	for _, e := range entries {
+		if e.Source == source {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 type BlockLogCount struct {
 	Value string `json:"value"`
 	Count int    `json:"count"`
@@ -780,10 +942,15 @@ type BlockLogSummary struct {
 // BlockLogSummary returns the most common client IPs and block reasons from
 // the in-memory log. Sorting makes the result stable for the UI and API.
 func (s *Store) BlockLogSummary(limit int) BlockLogSummary {
+	return s.BlockLogSummarySource("", limit)
+}
+
+// BlockLogSummarySource is BlockLogSummary for one source ("" = all).
+func (s *Store) BlockLogSummarySource(source string, limit int) BlockLogSummary {
 	if limit < 1 {
 		limit = 5
 	}
-	entries := s.log.Snapshot()
+	entries := filterSource(s.log.Snapshot(), source)
 	ips := make(map[string]int)
 	reasons := make(map[string]int)
 	for _, entry := range entries {
@@ -818,6 +985,9 @@ func sortedLogCounts(counts map[string]int, limit int) []BlockLogCount {
 	return items
 }
 
+// FlushLog fsyncs block-log lines not yet on disk (used at shutdown).
+func (s *Store) FlushLog() { s.log.Flush() }
+
 // Broadcaster returns the underlying log broadcaster for SSE subscribers.
 func (s *Store) Broadcaster() *broadcaster { return s.bcast }
 
@@ -847,12 +1017,44 @@ func (s *Store) AddTempBan(ip string, dur time.Duration) {
 	if ip == "" || dur <= 0 {
 		return
 	}
-	expiry := time.Now().Add(dur)
+	now := time.Now()
+	expiry := now.Add(dur)
 	s.banMu.Lock()
-	if cur, ok := s.tempBans[ip]; !ok || cur.Before(expiry) {
-		s.tempBans[ip] = expiry
+	defer s.banMu.Unlock()
+	cur, ok := s.tempBans[ip]
+	if !ok && !roomForKey(len(s.tempBans), func() { pruneExpired(s.tempBans, now) }, func() int { return len(s.tempBans) }) {
+		return
 	}
-	s.banMu.Unlock()
+	if !ok || cur.Before(expiry) {
+		s.tempBans[ip] = expiry
+		s.bansDirty = true
+	}
+}
+
+// roomForKey reports whether a map currently holding n keys may take a new
+// one, pruning it first when it is full.
+func roomForKey(n int, prune func(), size func() int) bool {
+	if n < maxTrackedKeys {
+		return true
+	}
+	prune()
+	return size() < maxTrackedKeys
+}
+
+func pruneExpired(m map[string]time.Time, now time.Time) {
+	for k, exp := range m {
+		if now.After(exp) {
+			delete(m, k)
+		}
+	}
+}
+
+func pruneStrikes(m map[string][]time.Time, cutoff time.Time) {
+	for k, hist := range m {
+		if len(hist) == 0 || !hist[len(hist)-1].After(cutoff) {
+			delete(m, k)
+		}
+	}
 }
 
 // RecordStrike adds a block strike for ip. If the count of strikes within
@@ -872,7 +1074,11 @@ func (s *Store) RecordStrike(ip string) time.Duration {
 	cutoff := now.Add(-time.Duration(cfg.WindowSeconds) * time.Second)
 
 	s.banMu.Lock()
-	hist := s.strikes[ip]
+	hist, tracked := s.strikes[ip]
+	if !tracked && !roomForKey(len(s.strikes), func() { pruneStrikes(s.strikes, cutoff) }, func() int { return len(s.strikes) }) {
+		s.banMu.Unlock()
+		return 0
+	}
 	// Drop strikes outside the window.
 	keep := hist[:0]
 	for _, t := range hist {
@@ -911,12 +1117,18 @@ func (s *Store) TempBansSnapshot() map[string]time.Time {
 	return out
 }
 
-// ClearTempBan removes an active temp ban.
+// ClearTempBan removes an active temp ban. It accepts an IP (an IPv6
+// address clears its /64) or a ban key as listed by TempBansSnapshot.
 func (s *Store) ClearTempBan(ip string) {
+	key := normalizeBanKey(ip)
 	s.banMu.Lock()
 	delete(s.tempBans, ip)
 	delete(s.strikes, ip)
+	delete(s.tempBans, key)
+	delete(s.strikes, key)
+	s.bansDirty = true
 	s.banMu.Unlock()
+	_ = s.SaveBans()
 }
 
 // banSweepLoop periodically removes expired temp bans and old strike
@@ -949,6 +1161,78 @@ func (s *Store) banSweepLoop() {
 			}
 		}
 		s.banMu.Unlock()
+		s.logThrottleMu.Lock()
+		for k, t := range s.logThrottle {
+			if now.Sub(t) >= repeatLogWindow {
+				delete(s.logThrottle, k)
+			}
+		}
+		s.logThrottleMu.Unlock()
+		_ = s.SaveBans()
+	}
+}
+
+type persistedBans struct {
+	IP          map[string]time.Time `json:"ip"`
+	Fingerprint map[string]time.Time `json:"fingerprint"`
+}
+
+// SaveBans writes active temp and fingerprint bans to bans.json (only when
+// they changed) so a Zoraxy or plugin restart doesn't pardon every scanner.
+func (s *Store) SaveBans() error {
+	s.banMu.Lock()
+	if !s.bansDirty {
+		s.banMu.Unlock()
+		return nil
+	}
+	now := time.Now()
+	out := persistedBans{IP: map[string]time.Time{}, Fingerprint: map[string]time.Time{}}
+	for k, v := range s.tempBans {
+		if v.After(now) {
+			out.IP[k] = v
+		}
+	}
+	for k, v := range s.fingerprintBans {
+		if v.After(now) {
+			out.Fingerprint[k] = v
+		}
+	}
+	s.bansDirty = false
+	s.banMu.Unlock()
+
+	data, err := json.Marshal(out)
+	if err == nil {
+		err = atomicWriteFile(s.bansPath, data, 0o600)
+	}
+	if err != nil {
+		s.banMu.Lock()
+		s.bansDirty = true
+		s.banMu.Unlock()
+	}
+	return err
+}
+
+func (s *Store) loadBans() {
+	data, err := os.ReadFile(s.bansPath)
+	if err != nil {
+		return
+	}
+	var in persistedBans
+	if json.Unmarshal(data, &in) != nil {
+		return
+	}
+	now := time.Now()
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	for k, v := range in.IP {
+		if v.After(now) && len(s.tempBans) < maxTrackedKeys {
+			s.tempBans[k] = v
+		}
+	}
+	for k, v := range in.Fingerprint {
+		if v.After(now) && len(s.fingerprintBans) < maxTrackedKeys {
+			s.fingerprintBans[k] = v
+		}
 	}
 }
 
@@ -975,12 +1259,18 @@ func (s *Store) AddFingerprintBan(fp string, dur time.Duration) {
 	if fp == "" || dur <= 0 {
 		return
 	}
-	expiry := time.Now().Add(dur)
+	now := time.Now()
+	expiry := now.Add(dur)
 	s.banMu.Lock()
-	if cur, ok := s.fingerprintBans[fp]; !ok || cur.Before(expiry) {
-		s.fingerprintBans[fp] = expiry
+	defer s.banMu.Unlock()
+	cur, ok := s.fingerprintBans[fp]
+	if !ok && !roomForKey(len(s.fingerprintBans), func() { pruneExpired(s.fingerprintBans, now) }, func() int { return len(s.fingerprintBans) }) {
+		return
 	}
-	s.banMu.Unlock()
+	if !ok || cur.Before(expiry) {
+		s.fingerprintBans[fp] = expiry
+		s.bansDirty = true
+	}
 }
 
 // RecordFingerprintStrike adds a block strike for a fingerprint signature.
@@ -999,7 +1289,11 @@ func (s *Store) RecordFingerprintStrike(fp string) time.Duration {
 	cutoff := now.Add(-time.Duration(cfg.WindowSeconds) * time.Second)
 
 	s.banMu.Lock()
-	hist := s.fingerprintStrikes[fp]
+	hist, tracked := s.fingerprintStrikes[fp]
+	if !tracked && !roomForKey(len(s.fingerprintStrikes), func() { pruneStrikes(s.fingerprintStrikes, cutoff) }, func() int { return len(s.fingerprintStrikes) }) {
+		s.banMu.Unlock()
+		return 0
+	}
 	// Drop strikes outside the window
 	keep := hist[:0]
 	for _, t := range hist {
@@ -1043,5 +1337,7 @@ func (s *Store) ClearFingerprintBan(fp string) {
 	s.banMu.Lock()
 	delete(s.fingerprintBans, fp)
 	delete(s.fingerprintStrikes, fp)
+	s.bansDirty = true
 	s.banMu.Unlock()
+	_ = s.SaveBans()
 }

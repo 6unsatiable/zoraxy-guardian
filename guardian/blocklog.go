@@ -6,26 +6,31 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 const (
-	maxBlockLog     = 500             // in-memory snapshot cap
+	maxBlockLog     = 2000            // in-memory snapshot cap
+	syncInterval    = time.Second     // how often appended lines are fsync'd
 	rotateAtSize    = 5 * 1024 * 1024 // 5 MiB
 	rotateKeepLines = 2000            // lines kept on rotate
 )
 
 // blockLog is an append-only JSONL writer backed by a bounded in-memory
 // ring. On open it tail-reads the file to repopulate the ring so the UI
-// keeps its history across restarts. Each Append is fsync'd so a container
-// kill doesn't drop recent entries. On size threshold the file is rotated
-// in place by keeping the most recent N lines.
+// keeps its history across restarts. Appends are fsync'd once a second in the
+// background: a per-line fsync under a scanner flood (thousands of blocks a
+// second) turned every block into a disk write while holding the log lock.
+// On size threshold the file is rotated in place by keeping the most recent
+// N lines.
 type blockLog struct {
 	path string
 	cap  int
 
-	mu   sync.Mutex
-	ring []BlockLogEntry
-	file *os.File
+	mu    sync.Mutex
+	ring  []BlockLogEntry
+	file  *os.File
+	dirty bool
 }
 
 func openBlockLog(path string, capLines int) (*blockLog, error) {
@@ -38,7 +43,26 @@ func openBlockLog(path string, capLines int) (*blockLog, error) {
 		return nil, err
 	}
 	bl.file = f
+	go bl.syncLoop()
 	return bl, nil
+}
+
+func (bl *blockLog) syncLoop() {
+	t := time.NewTicker(syncInterval)
+	defer t.Stop()
+	for range t.C {
+		bl.Flush()
+	}
+}
+
+// Flush fsyncs lines appended since the last flush.
+func (bl *blockLog) Flush() {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	if bl.dirty && bl.file != nil {
+		_ = bl.file.Sync()
+		bl.dirty = false
+	}
 }
 
 func (bl *blockLog) loadTail() error {
@@ -89,10 +113,7 @@ func (bl *blockLog) Append(entry BlockLogEntry) {
 	if bl.file != nil {
 		data = append(data, '\n')
 		if _, err := bl.file.Write(data); err == nil {
-			// Best-effort fsync. Block events are infrequent compared to
-			// real traffic, so the cost is negligible and worth it for
-			// crash durability.
-			_ = bl.file.Sync()
+			bl.dirty = true
 		}
 		bl.rotateIfNeededLocked()
 	}

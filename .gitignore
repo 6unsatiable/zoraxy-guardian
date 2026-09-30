@@ -19,3 +19,4 @@
 # Go test/coverage output
 *.out
 *.test
+dist/

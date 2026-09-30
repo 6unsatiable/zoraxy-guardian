@@ -3,9 +3,11 @@ package guardian
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	plugin "example.com/guardian/mod/zoraxy_plugin"
@@ -29,6 +31,50 @@ func (a *API) RegisterRoutes(ui *plugin.PluginUiRouter, mux *http.ServeMux) {
 	ui.HandleFunc("/api/fingerprintbans/clear", a.handleFingerprintBansClear, mux)
 	ui.HandleFunc("/api/import/cf", a.handleImportCF, mux)
 	ui.HandleFunc("/api/rules/recommended", a.handleRecommendedRules, mux)
+	ui.HandleFunc("/api/status", a.handleStatus, mux)
+}
+
+// handleStatus reports health signals the UI shows as banners: traffic that
+// arrived through a proxy Guardian doesn't trust, and suppressed log repeats.
+func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"untrusted_proxy":    a.store.ProxyWarningSnapshot(),
+		"suppressed_repeats": a.store.SuppressedRepeats(),
+		"temp_bans":          len(a.store.TempBansSnapshot()),
+	})
+}
+
+// writeUpdateError maps a Store.Update failure to 400 (bad config, the
+// message says what to fix) or 500 (could not be saved).
+func writeUpdateError(w http.ResponseWriter, err error) {
+	var verr *ValidationError
+	if errors.As(err, &verr) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// csvSafe neutralizes spreadsheet formulas. User-Agent and URI come from
+// attackers, and a cell like =HYPERLINK(...) would run when the export is
+// opened in Excel or Sheets.
+func csvSafe(v string) string {
+	if v != "" && strings.ContainsRune("=+-@\t\r", rune(v[0])) {
+		return "'" + v
+	}
+	return v
+}
+
+func sourceParam(r *http.Request) string {
+	switch src := r.URL.Query().Get("source"); src {
+	case "guardian", "zoraxy":
+		return src
+	}
+	return ""
 }
 
 func (a *API) handleBlockLogSummary(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +82,7 @@ func (a *API) handleBlockLogSummary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, a.store.BlockLogSummary(5))
+	writeJSON(w, http.StatusOK, a.store.BlockLogSummarySource(sourceParam(r), 5))
 }
 
 func (a *API) handleBlockLogExport(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +90,7 @@ func (a *API) handleBlockLogExport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	entries := a.store.LogPage(0, 0)
+	entries := a.store.LogPageSource(sourceParam(r), 0, 0)
 	switch r.URL.Query().Get("format") {
 	case "json", "":
 		w.Header().Set("Content-Type", "application/json")
@@ -56,11 +102,15 @@ func (a *API) handleBlockLogExport(w http.ResponseWriter, r *http.Request) {
 		writer := csv.NewWriter(w)
 		_ = writer.Write([]string{"time", "source", "ip", "fingerprint", "host", "method", "request_uri", "user_agent", "reason", "status"})
 		for _, entry := range entries {
-			_ = writer.Write([]string{
+			row := []string{
 				entry.Time.UTC().Format(time.RFC3339), entry.Source, entry.IP, entry.Fingerprint,
 				entry.Host, entry.Method, entry.RequestURI, entry.UserAgent, entry.Reason,
 				strconv.Itoa(entry.Status),
-			})
+			}
+			for i := range row {
+				row[i] = csvSafe(row[i])
+			}
+			_ = writer.Write(row)
 		}
 		writer.Flush()
 	default:
@@ -81,7 +131,7 @@ func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.store.Update(cfg); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeUpdateError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -97,9 +147,10 @@ func (a *API) handleBlockLog(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := nonNegative(atoiDefault(r.URL.Query().Get("offset"), 0))
 	limit := nonNegative(atoiDefault(r.URL.Query().Get("limit"), 0)) // 0 = all
-	entries := a.store.LogPage(offset, limit)
+	source := sourceParam(r)
+	entries := a.store.LogPageSource(source, offset, limit)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total":   a.store.LogTotal(),
+		"total":   a.store.LogTotalSource(source),
 		"offset":  offset,
 		"limit":   limit,
 		"entries": entries,
@@ -161,7 +212,7 @@ func (a *API) handleTempBans(w http.ResponseWriter, r *http.Request) {
 	}
 	bans := a.store.TempBansSnapshot()
 	type entry struct {
-		IP      string `json:"ip"`
+		IP      string `json:"ip"` // an IPv4 address or an IPv6 /64
 		Expires string `json:"expires"`
 	}
 	out := make([]entry, 0, len(bans))
@@ -250,7 +301,7 @@ func (a *API) handleImportCF(w http.ResponseWriter, r *http.Request) {
 	cfg := a.store.Snapshot()
 	stats := MergeCFResult(&cfg, parsed)
 	if err := a.store.Update(cfg); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeUpdateError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -282,7 +333,7 @@ func (a *API) handleRecommendedRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.Update(cfg); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeUpdateError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"applied": stats})

@@ -4,6 +4,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // HostMatches returns true if host matches any pattern in patterns.
@@ -44,13 +45,21 @@ func matchOne(host, pattern string) bool {
 	if !strings.ContainsAny(pattern, "*?") {
 		return host == pattern
 	}
-	re := globToRegex(pattern)
-	matched, err := regexp.MatchString(re, host)
-	if err != nil {
-		return false
+	re, ok := globCache.Load(pattern)
+	if !ok {
+		compiled, err := regexp.Compile(globToRegex(pattern))
+		if err != nil {
+			return false
+		}
+		// Patterns come from the config, so the cache stays small.
+		re, _ = globCache.LoadOrStore(pattern, compiled)
 	}
-	return matched
+	return re.(*regexp.Regexp).MatchString(host)
 }
+
+// globCache holds compiled host globs: matchOne runs for every rule on every
+// request, and compiling a regexp each time was the plugin's hottest path.
+var globCache sync.Map
 
 func globToRegex(p string) string {
 	var b strings.Builder

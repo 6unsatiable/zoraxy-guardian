@@ -27,6 +27,11 @@ import (
 // After any block (other than temp-ban itself, which is already promoted),
 // the IP gets a strike towards auto-ban escalation, and if fingerprint
 // tracking is enabled, the request fingerprint also gets a strike.
+//
+// When the resolved address is itself a proxy (traffic through Cloudflare or
+// another proxy that is not trusted), matching requests are still blocked but
+// the address is never banned, struck or rate limited, because every visitor
+// behind that proxy shares it.
 func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	s.mu.RLock()
 	host := req.Host
@@ -46,23 +51,41 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 
 	ip := clientIP(req, trustedProxies)
 	parsedIP := net.ParseIP(ip)
+	viaProxy := isProxyAddress(parsedIP, trustedProxies)
+	if viaProxy {
+		s.noteUntrustedProxy(ip, host)
+	}
+	key := banKey(ip)
 
 	// Generate fingerprint for cross-IP tracking
 	var fingerprint string
 	if fpEnabled {
 		fingerprint = GenerateFingerprint(req)
 	}
+	block := func(reason string, status int) Decision {
+		return Decision{Block: true, Reason: reason, Status: status, IP: ip}
+	}
+	strike := func() {
+		if !viaProxy {
+			s.RecordStrike(key)
+		}
+		if fpEnabled && fingerprint != "" {
+			s.RecordFingerprintStrike(fingerprint)
+		}
+	}
 
 	// 1. Fingerprint ban (check before IP ban to catch IP-hopping attackers)
 	if fpEnabled && fingerprint != "" {
 		if banned, _ := s.IsFingerprintBanned(fingerprint); banned {
-			return Decision{Block: true, Reason: "fingerprint-ban", Status: http.StatusForbidden}
+			return block("fingerprint-ban", http.StatusForbidden)
 		}
 	}
 
 	// 2. Temp ban
-	if banned, _ := s.IsTempBanned(ip); banned {
-		return Decision{Block: true, Reason: "temp-ban", Status: http.StatusForbidden}
+	if !viaProxy {
+		if banned, _ := s.IsTempBanned(key); banned {
+			return block("temp-ban", http.StatusForbidden)
+		}
 	}
 
 	// 3. IP blocklist
@@ -72,11 +95,8 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 				continue
 			}
 			if r.Net.Contains(parsedIP) {
-				s.RecordStrike(ip)
-				if fpEnabled && fingerprint != "" {
-					s.RecordFingerprintStrike(fingerprint)
-				}
-				return Decision{Block: true, Reason: "ip-blocklist", Status: http.StatusForbidden}
+				strike()
+				return block("ip-blocklist", http.StatusForbidden)
 			}
 		}
 	}
@@ -87,24 +107,23 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			continue
 		}
 		if r.RE.MatchString(host) {
-			s.RecordStrike(ip)
-			if fpEnabled && fingerprint != "" {
-				s.RecordFingerprintStrike(fingerprint)
-			}
-			return Decision{Block: true, Reason: "host-blocklist", Status: http.StatusForbidden}
+			strike()
+			return block("host-blocklist", http.StatusForbidden)
 		}
 	}
 
 	// 5. Honeypot path match — install temp ban as a side-effect
 	if honeypotEnabled {
+		path := requestPath(req.RequestURI)
 		for _, r := range honeypotRules {
 			if !HostMatches(host, r.Hosts) {
 				continue
 			}
-			if r.RE.MatchString(requestPath(req.RequestURI)) {
-				dur := time.Duration(honeypotBanSecs) * time.Second
-				s.AddTempBan(ip, dur)
-				return Decision{Block: true, Reason: "honeypot", Status: http.StatusForbidden}
+			if r.RE.MatchString(path) {
+				if !viaProxy {
+					s.AddTempBan(key, time.Duration(honeypotBanSecs)*time.Second)
+				}
+				return block("honeypot", http.StatusForbidden)
 			}
 		}
 	}
@@ -117,26 +136,18 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 	if len(allowHostScoped) > 0 {
-		if parsedIP == nil {
-			s.RecordStrike(ip)
-			if fpEnabled && fingerprint != "" {
-				s.RecordFingerprintStrike(fingerprint)
-			}
-			return Decision{Block: true, Reason: "not-allowlisted", Status: http.StatusForbidden}
-		}
 		allowed := false
-		for _, r := range allowHostScoped {
-			if r.Net.Contains(parsedIP) {
-				allowed = true
-				break
+		if parsedIP != nil {
+			for _, r := range allowHostScoped {
+				if r.Net.Contains(parsedIP) {
+					allowed = true
+					break
+				}
 			}
 		}
 		if !allowed {
-			s.RecordStrike(ip)
-			if fpEnabled && fingerprint != "" {
-				s.RecordFingerprintStrike(fingerprint)
-			}
-			return Decision{Block: true, Reason: "not-allowlisted", Status: http.StatusForbidden}
+			strike()
+			return block("not-allowlisted", http.StatusForbidden)
 		}
 	}
 
@@ -150,35 +161,26 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			continue
 		}
 		if r.RE.MatchString(ua) {
-			s.RecordStrike(ip)
-			if fpEnabled && fingerprint != "" {
-				s.RecordFingerprintStrike(fingerprint)
-			}
-			return Decision{Block: true, Reason: "ua-blocklist", Status: http.StatusForbidden}
+			strike()
+			return block("ua-blocklist", http.StatusForbidden)
 		}
 	}
 
 	// 8. WAF rules
 	if hit := wafCheck(req, host, wafRules, wafNames); hit != "" {
-		s.RecordStrike(ip)
-		if fpEnabled && fingerprint != "" {
-			s.RecordFingerprintStrike(fingerprint)
-		}
-		return Decision{Block: true, Reason: "waf-" + hit, Status: http.StatusForbidden}
+		strike()
+		return block("waf-"+hit, http.StatusForbidden)
 	}
 
 	// 9. Rate limit
-	if limiter != nil && parsedIP != nil {
-		if !limiter.allow(parsedIP.String()) {
-			s.RecordStrike(ip)
-			if fpEnabled && fingerprint != "" {
-				s.RecordFingerprintStrike(fingerprint)
-			}
-			return Decision{Block: true, Reason: "rate-limit", Status: http.StatusTooManyRequests}
+	if limiter != nil && parsedIP != nil && !viaProxy {
+		if !limiter.allow(key) {
+			strike()
+			return block("rate-limit", http.StatusTooManyRequests)
 		}
 	}
 
-	return Decision{Block: false}
+	return Decision{Block: false, IP: ip}
 }
 
 // pathExempt returns true if requestURI contains any of the literal except
@@ -220,52 +222,53 @@ func wafCheck(req *plugin.DynamicSniffForwardRequest, host string, rules []compi
 			target += " " + strings.Join(vs, " ")
 		}
 	}
+	// Attackers percent-encode payloads (%3Cscript, ..%2f, double-encoded
+	// %252e) to get past literal patterns, so rules also see the decoded form.
+	decoded := percentDecode(percentDecode(target))
 	for i, r := range rules {
 		if !HostMatches(host, r.Hosts) {
 			continue
 		}
-		if r.RE.MatchString(target) {
+		if r.RE.MatchString(target) || (decoded != target && r.RE.MatchString(decoded)) {
 			return names[i]
 		}
 	}
 	return ""
 }
 
-// clientIP returns the direct peer unless that peer belongs to a configured
-// trusted-proxy CIDR. When the peer is trusted, X-Forwarded-For is walked from
-// right to left and the first untrusted address is selected. This prevents a
-// client from spoofing its address by supplying forwarding headers directly.
-func clientIP(req *plugin.DynamicSniffForwardRequest, trustedProxies []compiledIPRule) string {
-	remote := remoteIP(req.RemoteAddr)
-	if remote == nil {
-		return req.RemoteAddr
+// percentDecode decodes valid %XX escapes and leaves anything malformed as
+// it is, so one bad escape can't hide the rest of a payload the way a strict
+// decoder's error would. '+' is left alone (it is only a space in forms).
+func percentDecode(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
 	}
-	if !ipInRules(remote, trustedProxies) {
-		return remote.String()
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
 	}
+	return b.String()
+}
 
-	if xff := firstHeader(req.Header, "X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		chain := make([]net.IP, 0, len(parts))
-		for _, part := range parts {
-			ip := net.ParseIP(strings.TrimSpace(part))
-			if ip == nil {
-				return remote.String()
-			}
-			chain = append(chain, ip)
-		}
-		for i := len(chain) - 1; i >= 0; i-- {
-			if !ipInRules(chain[i], trustedProxies) {
-				return chain[i].String()
-			}
-		}
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0'
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
 	}
-	if xri := firstHeader(req.Header, "X-Real-IP"); xri != "" {
-		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
-			return ip.String()
-		}
-	}
-	return remote.String()
 }
 
 func remoteIP(addr string) net.IP {

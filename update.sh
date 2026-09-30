@@ -7,35 +7,40 @@
 # It will:
 #   1. Fetch the latest binary from GitHub releases (rolling 'latest' tag).
 #   2. Verify it runs (with -introspect).
-#   3. Atomically swap it into <plugins-dir>/guardian/guardian.
+#   3. Find the existing Guardian install in <plugins-dir> (any folder name -
+#      Zoraxy's plugin-directory installer uses "Guardian/Guardian") and
+#      atomically swap the new binary in, keeping the old one as *.bak.
+#      A fresh install goes to <plugins-dir>/Guardian/Guardian.
 #   4. Print a reminder to restart your Zoraxy container manually.
 #
 # Usage:
 #   ./update.sh [--dir <plugins-dir>] [--version <tag>] [--arch <amd64|arm64|arm>]
 #
 # Defaults:
-#   --dir       /opt/zoraxy/plugins   (override with $ZORAXY_PLUGINS_DIR)
+#   --dir       $ZORAXY_PLUGINS_DIR, else the first that exists of
+#               /opt/zoraxy/plugin (Docker image) and /opt/zoraxy/plugins
 #   --version   latest                (the rolling main-branch release)
 #   --arch      auto-detected via uname -m
 #
 # Examples:
-#   ZORAXY_PLUGINS_DIR=/srv/zoraxy/plugins ./update.sh
-#   ./update.sh --dir /opt/zoraxy/plugins --version v0.2.0
+#   ZORAXY_PLUGINS_DIR=/srv/zoraxy/plugin ./update.sh
+#   ./update.sh --dir /opt/zoraxy/plugin --version v0.3.0
 
 set -euo pipefail
 
-PLUGINS_DIR="${ZORAXY_PLUGINS_DIR:-/opt/zoraxy/plugins}"
+PLUGINS_DIR="${ZORAXY_PLUGINS_DIR:-}"
 VERSION="latest"
 ARCH=""
-REPO="articrevised/zoraxy-guardian"
-PLUGIN_NAME="guardian"
+REPO="6unsatiable/zoraxy-guardian"
+PLUGIN_ID="com.guardian.zoraxy"
+PLUGIN_NAME="Guardian"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dir)     PLUGINS_DIR="$2"; shift 2 ;;
         --version) VERSION="$2";     shift 2 ;;
         --arch)    ARCH="$2";        shift 2 ;;
-        -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
         *)         echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -49,13 +54,38 @@ if [ -z "$ARCH" ]; then
     esac
 fi
 
-ASSET="linux_${ARCH}_guardian"
-TARGET_DIR="${PLUGINS_DIR}/${PLUGIN_NAME}"
-TARGET="${TARGET_DIR}/${PLUGIN_NAME}"
-
 step() { printf "\n\033[1;34m==>\033[0m %s\n" "$*"; }
 ok()   { printf "\033[1;32m✓\033[0m %s\n" "$*"; }
 die()  { printf "\033[1;31m✗\033[0m %s\n" "$*" >&2; exit 1; }
+
+if [ -z "$PLUGINS_DIR" ]; then
+    for d in /opt/zoraxy/plugin /opt/zoraxy/plugins; do
+        if [ -d "$d" ]; then PLUGINS_DIR="$d"; break; fi
+    done
+    [ -n "$PLUGINS_DIR" ] || die "no plugin directory found; pass --dir <host path mounted at /opt/zoraxy/plugin>"
+fi
+[ -d "$PLUGINS_DIR" ] || die "plugin directory ${PLUGINS_DIR} does not exist"
+
+ASSET="linux_${ARCH}_guardian"
+
+# Update the binary Zoraxy actually runs. Installing next to it under another
+# folder name would leave two copies with the same plugin ID.
+TARGET=""
+for f in "$PLUGINS_DIR"/*/*; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    case "$f" in *.bak|*.new|*.tmp) continue ;; esac
+    if timeout 10 "$f" -introspect 2>/dev/null | grep -q "\"${PLUGIN_ID}\""; then
+        TARGET="$f"
+        break
+    fi
+done
+if [ -n "$TARGET" ]; then
+    ok "existing install: ${TARGET}"
+else
+    TARGET="${PLUGINS_DIR}/${PLUGIN_NAME}/${PLUGIN_NAME}"
+    ok "no existing install; installing to ${TARGET}"
+fi
+TARGET_DIR="$(dirname "$TARGET")"
 
 step "Resolving release ${VERSION} for ${ASSET}"
 if [ "$VERSION" = "latest" ]; then
@@ -80,7 +110,7 @@ chmod +x "${TMP}/${PLUGIN_NAME}"
 ok "downloaded $(wc -c < "${TMP}/${PLUGIN_NAME}") bytes"
 
 step "Verifying binary"
-if ! "${TMP}/${PLUGIN_NAME}" -introspect >/dev/null 2>&1; then
+if ! "${TMP}/${PLUGIN_NAME}" -introspect 2>/dev/null | grep -q "\"${PLUGIN_ID}\""; then
     die "downloaded binary fails -introspect; refusing to install"
 fi
 ok "introspect ok"
@@ -91,6 +121,10 @@ mkdir -p "$TARGET_DIR"
 TMP_DEST="${TARGET}.new"
 cp "${TMP}/${PLUGIN_NAME}" "$TMP_DEST"
 chmod +x "$TMP_DEST"
+if [ -f "$TARGET" ]; then
+    cp -p "$TARGET" "${TARGET}.bak"
+    ok "previous binary kept as ${TARGET}.bak"
+fi
 mv -f "$TMP_DEST" "$TARGET"
 ok "installed"
 

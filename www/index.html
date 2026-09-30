@@ -15,6 +15,7 @@
   <button id="theme-toggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">🌓</button>
   <span id="status" class="status"></span>
 </header>
+<div id="proxy-banner" class="banner" hidden></div>
 
 <nav>
   <button class="tab active" data-tab="ip">IP rules</button>
@@ -80,7 +81,7 @@
 
   <section id="tab-honeypot" class="tab-panel">
     <h2>Honeypot paths</h2>
-    <p class="hint">Immediately ban requests for paths your sites never use, such as <code>/.env</code>. Review the list first; literal paths match the path only, and <code>*</code> adds a wildcard.</p>
+    <p class="hint">Immediately ban requests for paths your sites never use, such as <code>/.env</code>. Review the list first. Matching ignores case and the query string. A literal path matches anywhere in the path (<code>/.env</code> also catches <code>/api/.env</code>); a path with wildcards must match the whole path, where <code>*</code> stays within one segment and <code>**</code> spans segments (<code>/backup*.zip</code>, <code>/**/phpinfo.php</code>).</p>
     <label><input type="checkbox" id="honeypot-enabled"> Enabled</label>
     <label>Ban duration (seconds) <input type="number" id="honeypot-ban-secs" min="60" value="3600"></label>
     <table class="scoped-table" id="honeypot-table">
@@ -153,6 +154,9 @@
     <h2>General</h2>
     <label>Trusted proxy CIDRs <input type="text" id="trusted-proxy-cidrs" placeholder="172.17.0.0/16, 10.0.0.0/8"></label>
     <p class="hint">Forwarded client-IP headers are used only when Zoraxy's direct peer matches one of these CIDRs. Leave empty if Zoraxy receives traffic directly.</p>
+    <label><input type="checkbox" id="trust-cloudflare"> Trust Cloudflare (built-in edge ranges; uses <code>CF-Connecting-IP</code>)</label>
+    <p class="hint">Turn this on if any site behind Zoraxy is proxied through Cloudflare (orange cloud). Without it, Guardian sees Cloudflare's servers instead of your visitors. Guardian never bans a proxy address either way, but it can't ban the real attacker until it can see them.</p>
+    <label><input type="checkbox" id="ignore-zoraxy-blacklist"> Don't mirror Zoraxy's own blacklist / geo blocks into the block log</label>
     <h2>Recommended rule updates</h2>
     <p class="hint">Preview or merge this release's UA, WAF, and honeypot rules. Your custom and host-scoped rules stay unchanged.</p>
     <div class="inline-actions">
@@ -173,6 +177,11 @@
     <h2>Block log <span class="count" id="log-count"></span></h2>
     <p class="hint">Review recent blocks, search by IP or rule, and use the reason column to tune your policy.</p>
     <div class="log-controls">
+      <select id="log-source" title="Show blocks from">
+        <option value="">All sources</option>
+        <option value="guardian">Guardian only</option>
+        <option value="zoraxy">Zoraxy only</option>
+      </select>
       <input type="text" id="log-filter" placeholder="Filter (IP, host, reason, UA)…" />
       <button id="log-refresh">Refresh</button>
       <button id="log-export-json">Export JSON</button>

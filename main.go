@@ -29,12 +29,12 @@ func main() {
 		Name:          "Guardian",
 		Author:        "6unsatiable",
 		AuthorContact: "articrevised@gmail.com",
-		Description:   "Dynamic-capture security plugin: IP allow/block lists, UA blocklist, WAF payload patterns, per-IP rate limiting. Host-scopable rules.",
+		Description:   "Dynamic-capture security plugin with scoped IP and UA rules, WAF patterns, rate limiting, honeypots, and auto-bans. Cloudflare-aware.",
 		URL:           "https://github.com/6unsatiable/zoraxy-guardian",
 		Type:          plugin.PluginType_Router,
 		VersionMajor:  0,
-		VersionMinor:  2,
-		VersionPatch:  4,
+		VersionMinor:  3,
+		VersionPatch:  0,
 
 		DynamicCaptureSniff:   DynamicSniffIngress,
 		DynamicCaptureIngress: DynamicCaptureIngress,
@@ -80,6 +80,8 @@ func main() {
 	ui := plugin.NewPluginEmbedUIRouter(PluginID, &content, "/www", UIPath)
 	ui.RegisterTerminateHandler(func() {
 		_ = store.Save()
+		_ = store.SaveBans()
+		store.FlushLog()
 		fmt.Println("Guardian: shutting down")
 	}, nil)
 

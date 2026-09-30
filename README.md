@@ -2,8 +2,8 @@
 
 A [Zoraxy](https://github.com/tobychui/zoraxy) plugin that adds an L7 security layer to your reverse-proxy rules: IP allow/block lists, User-Agent blocklists, WAF-style payload pattern matching, and per-IP rate limiting — with per-host scopes so each rule can apply globally or only to specific vhosts.
 
-[![build-and-release](https://github.com/articrevised/zoraxy-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/articrevised/zoraxy-guardian/actions/workflows/release.yml)
-[![latest release](https://img.shields.io/github/v/release/articrevised/zoraxy-guardian?include_prereleases&label=rolling)](https://github.com/articrevised/zoraxy-guardian/releases/tag/latest)
+[![build-and-release](https://github.com/6unsatiable/zoraxy-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/6unsatiable/zoraxy-guardian/actions/workflows/release.yml)
+[![latest release](https://img.shields.io/github/v/release/6unsatiable/zoraxy-guardian?include_prereleases&label=rolling)](https://github.com/6unsatiable/zoraxy-guardian/releases/tag/latest)
 
 ---
 
@@ -27,7 +27,7 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 |---|---|
 | **IP rules** | Allowlist + blocklist. CIDR (IPv4 + IPv6) and single IPs. |
 | **User-Agent blocklist** | Go regex (use `(?i)` for case-insensitive). |
-| **WAF rules** | Go regex over URI, full URL, Cookie, Referer. 10 consolidated default rules. |
+| **WAF rules** | Go regex over URI, full URL, Cookie, Referer, checked both as sent and percent-decoded (twice, for double encoding). 10 consolidated default rules. |
 | **Rate limit** | Per-IP token bucket with automatic idle bucket eviction. |
 | **Honeypot paths** | Any request to a tripwire URL (e.g. `/.env`, `/wp-login.php`) installs a temp ban on the source IP. |
 | **Host-header blocklist** | Block by regex against the request's `Host` header — useful for rejecting probes that arrive with `Host: localhost` etc. |
@@ -35,9 +35,11 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 | **Cloudflare rule import** | Paste a Cloudflare WAF / Custom Rule expression and Guardian translates it into the right primitives. Handles path/query/UA/host predicates with AND/OR/NOT, multi-clause expressions, and the `path ne X and (...)` exemption pattern. |
 | **Auto-ban escalation** | After N strikes in a sliding window, the IP gets a temp ban — escalates noisy scanners from per-rule blocks to a wholesale ban. |
 | **Per-host scopes** | Each rule has an optional host glob filter — `*.api.test`, `**.example.com`, `*`, or exact. |
-| **Live block log** | Last 500 events kept in memory; mirrored to JSONL on disk with fsync; restored on restart; auto-rotates at 5 MiB. Sensitive query values are redacted; the UI includes live updates, top counts, and JSON/CSV exports. |
+| **Live block log** | Last 2000 events kept in memory; mirrored to JSONL on disk (fsync'd every second); restored on restart; auto-rotates at 5 MiB. Repeat hits from an already-banned client are logged once a minute. Sensitive query values are redacted; the UI includes live updates, a source filter, top counts, and JSON/CSV exports (CSV cells are formula-safe). |
 | **Zoraxy event subscription** | Mirrors Zoraxy's own `blacklistedIpBlocked` events into Guardian's log. |
-| **Trusted proxies** | Honors `X-Forwarded-For`/`X-Real-IP` only when Zoraxy's direct peer is in a configured trusted-proxy CIDR. |
+| **Trusted proxies** | Honors `X-Forwarded-For`/`X-Real-IP` only when Zoraxy's direct peer is in a configured trusted-proxy CIDR. Uses Zoraxy's own resolved `client_ip` (v3.3.5+) when Zoraxy trusted the headers. |
+| **Cloudflare aware** | One switch trusts Cloudflare's built-in edge ranges and reads `CF-Connecting-IP` (only from real Cloudflare addresses). A proxy address is never banned, struck or rate limited, and the UI warns when traffic arrives through a proxy Guardian doesn't trust. |
+| **Persistent bans** | Temp and fingerprint bans are saved to `bans.json` and survive a restart. IPv6 clients are banned and rate limited per /64. |
 | **Dark mode** | Light / dark theme toggle, persisted in localStorage; defaults to system preference. |
 | **No external services** | Single ~6 MB Go binary. Embedded UI. No DB, no Redis. |
 
@@ -64,12 +66,13 @@ The same `update.sh` script also installs from scratch. On the Zoraxy host:
 
 ```bash
 # One-time: pull the installer
-curl -fsSL https://raw.githubusercontent.com/articrevised/zoraxy-guardian/main/update.sh \
+curl -fsSL https://raw.githubusercontent.com/6unsatiable/zoraxy-guardian/main/update.sh \
   -o /usr/local/bin/guardian-update
 chmod +x /usr/local/bin/guardian-update
 
-# Install (replace with the host path bind-mounted to the container's plugins dir)
-guardian-update --dir /opt/zoraxy/plugins
+# Install (replace with the host path bind-mounted to the container's
+# /opt/zoraxy/plugin dir). An existing install is found and updated in place.
+guardian-update --dir /path/to/zoraxy/plugin
 
 # Restart the Zoraxy container
 docker restart <zoraxy-container-name>
@@ -86,19 +89,21 @@ Then in Zoraxy's web UI:
 ### Updating
 
 ```bash
-guardian-update --dir /opt/zoraxy/plugins
+guardian-update --dir /path/to/zoraxy/plugin
 docker restart <zoraxy-container-name>
 ```
 
-`guardian-update` defaults to the rolling `latest` release. Pin to a specific version with `--version v0.2.0`.
+`guardian-update` defaults to the rolling `latest` release. Pin to a specific version with `--version v0.3.0`. The previous binary is kept as `<binary>.bak`.
+Zoraxy v3.3.5+ can also update the plugin from its Plugins page when it was installed from the plugin directory.
 
 ### Manual install (non-Docker)
 
 ```bash
-mkdir -p /path/to/zoraxy/plugins/guardian
-curl -fsSL -o /path/to/zoraxy/plugins/guardian/guardian \
-  https://github.com/articrevised/zoraxy-guardian/releases/download/latest/linux_amd64_guardian
-chmod +x /path/to/zoraxy/plugins/guardian/guardian
+# Zoraxy runs the file named like its folder: <plugin dir>/Guardian/Guardian
+mkdir -p /path/to/zoraxy/plugin/Guardian
+curl -fsSL -o /path/to/zoraxy/plugin/Guardian/Guardian \
+  https://github.com/6unsatiable/zoraxy-guardian/releases/download/latest/linux_amd64_guardian
+chmod +x /path/to/zoraxy/plugin/Guardian/Guardian
 sudo systemctl restart zoraxy
 ```
 
@@ -136,7 +141,7 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 
 **Rate limit** — Per-IP token bucket. Configure requests/minute and burst. Buckets idle for >10 min are swept automatically; the map is hard-capped at 50k entries.
 
-**Honeypot** — A list of "tripwire" URL paths. Any request matching one of them adds the source IP to the temp-ban list for the configured duration. Defaults cover exposed secrets, CMS/database probes, framework diagnostics, and known appliance paths. It is OFF by default — turn it on once you've reviewed the path list.
+**Honeypot** — A list of "tripwire" URL paths. Any request matching one of them adds the source IP to the temp-ban list for the configured duration. Matching ignores case and the query string. A literal path matches anywhere in the path (`/.env` also catches `/api/.env`); a path with wildcards must match the whole path, where `*`/`?` stay inside one segment and `**` spans segments (`/backup*.zip`, `/**/phpinfo.php`). Defaults cover exposed secrets, CMS/database probes, framework diagnostics, and known appliance paths. It is OFF by default — turn it on once you've reviewed the path list.
 
 **Auto-ban** — After an IP triggers any block rule `Threshold` times within `Window` seconds, it gets promoted to the temp-ban list for `Ban duration`. Honeypot hits install temp bans directly without strikes.
 
@@ -158,7 +163,7 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 
 Anything else (e.g. `cf.threat_score`, `ip.geoip.country`, `ssl`, method/header subfields) is reported as a warning rather than translated.
 
-**General** — Configure the CIDRs of proxies directly in front of Zoraxy. Forwarding headers are ignored for all other peers, preventing client-IP spoofing. This tab also previews or merges the current recommended UA, WAF, and honeypot rules without replacing custom or host-scoped rules.
+**General** — Turn on **Trust Cloudflare** if any site is proxied through Cloudflare (orange cloud); otherwise Guardian sees Cloudflare's servers instead of your visitors. Configure the CIDRs of any other proxies directly in front of Zoraxy. Forwarding headers are ignored for all other peers, preventing client-IP spoofing. This tab also previews or merges the current recommended UA, WAF, and honeypot rules without replacing custom or host-scoped rules.
 
 **Block log** — Recent block events with source (`guardian` vs `zoraxy`), reason, and status code. Paginated 50 at a time with a free-text filter, top IP/rule counts, and JSON/CSV exports. New blocks appear live via Server-Sent Events (the green/red dot in the header reflects connection status). Values for common credential query keys are redacted before logging.
 
@@ -223,7 +228,7 @@ Guardian also subscribes to `/zoraxy_event/<event-name>` so Zoraxy can push nati
 Requires Go 1.23+.
 
 ```bash
-git clone https://github.com/articrevised/zoraxy-guardian
+git clone https://github.com/6unsatiable/zoraxy-guardian
 cd zoraxy-guardian
 
 # Run the test suite
@@ -246,6 +251,7 @@ SKIP_PUSH=1 ./build.sh
 ├── guardian/
 │   ├── state.go              ← Config, Store, persistence, temp bans, strike tracker
 │   ├── sniff.go              ← rule evaluation pipeline
+│   ├── clientip.go           ← client IP resolution, Cloudflare ranges, ban keys
 │   ├── ingress.go            ← block-response writer
 │   ├── ratelimit.go          ← token bucket per IP, background sweep
 │   ├── host.go               ← glob host matching
@@ -304,6 +310,10 @@ Confirm Guardian is assigned to the **same tag** as the HTTP Proxy Rule you want
 
 Static IP block rules are evaluated first; rate-limit is last. If a scanner is matching one of the earlier rules (e.g. UA blocklist), you'll see `ua-blocklist` in the log instead of `rate-limit`. This is intentional — the more specific reason is more useful.
 
+### The block log shows Cloudflare addresses (104.16.x, 172.64–71.x, 162.158.x …)
+
+Your site is proxied through Cloudflare and Guardian isn't trusting it, so every visitor looks like a Cloudflare server. Turn on **General → Trust Cloudflare**. Before v0.3.0 this could ban a Cloudflare edge and lock out everyone routed through it; since v0.3.0 proxy addresses are never banned or rate limited, and the UI shows a warning banner until it's fixed.
+
 ### Guardian sees my IP as Zoraxy's loopback
 
 In **General**, add the CIDR of the proxy or Docker network directly connected to Zoraxy, such as `172.17.0.0/16`. Guardian then trusts forwarding headers only from that peer range and picks the rightmost untrusted address from `X-Forwarded-For`. Never add a public client range just to make this work.
@@ -318,6 +328,7 @@ Located next to the binary at `<plugins-dir>/guardian/`:
 |---|---|---|
 | `config.json` | Live config, written on every save. | Yes — Guardian regenerates defaults on next start. |
 | `blocklog.jsonl` | Append-only block log. Auto-rotates at 5 MiB. | Yes — but you lose history. |
+| `bans.json` | Active temp and fingerprint bans, saved every minute and on shutdown. | Yes — this lifts all current bans. |
 
 ---
 
