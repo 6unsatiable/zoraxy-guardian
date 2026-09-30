@@ -124,22 +124,22 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 
 **User agents** — Regex blocklist. The three defaults group common network scanners, web-vulnerability scanners, and content-discovery tools so the list remains easy to review.
 
-**WAF rules** — Toggleable regex rules. Patterns match against `request_uri + " " + url + cookie + referer`. The defaults consolidate related signatures into a smaller, reviewable set:
+**WAF rules** — Toggleable regex rules. v0.4.0 replaced the v0.2/v0.3 `xss-pattern`, `sqli-boolean-comment` and `command-injection` defaults, which blocked ordinary traffic (`?only=`, an `onboarding` cookie, slugs like `tom-and-jerry--movie`, JWT cookies). Existing installs get the new ones via **General → Merge recommended rules**, which only replaces unedited old defaults. Patterns match against `request_uri + " " + url + cookie + referer`. The defaults consolidate related signatures into a smaller, reviewable set:
 
 | Name | Catches |
 |---|---|
 | `sqli-union` | `UNION SELECT` injection variants |
-| `sqli-boolean-comment` | Comment-based SQLi (`--`, `#`, `/*`) combined with `OR`/`AND` |
+| `sqli-boolean-comment` | A quote followed by a comment (`admin'--`), quote-then-`OR`/`AND` (`' or '1'='1`), and numeric tautologies (`or 1=1`) |
 | `sqli-time-based` | Time-delay SQLi (`sleep`, `benchmark`, `pg_sleep`) |
-| `xss-pattern` | `<script>` tags, `javascript:` URIs, and event handlers such as `onerror=` |
+| `xss-pattern` | `<script>`/`<iframe>`/`<object>`/`<embed>` tags, `javascript:` URIs, and real DOM event handlers such as `onerror=` (not every parameter starting with "on") |
 | `path-traversal` | `../` and `..\` |
-| `null-byte` | `%00` |
-| `command-injection` | Shell chains followed by common execution/download tools |
+| `null-byte` | `%00`, including double-encoded (`%2500`) |
+| `command-injection` | Shell separators or `$(…)`/backticks followed by a download/shell tool used as a command |
 | `log4shell` | `${jndi:...}` payloads |
 | `dangerous-uri-scheme` | `php://`, `file://`, and `expect://` wrappers |
 | `ssrf-metadata` | Requests targeting common cloud metadata services |
 
-**Rate limit** — Per-IP token bucket. Configure requests/minute and burst. Buckets idle for >10 min are swept automatically; the map is hard-capped at 50k entries.
+**Rate limit** — Per-IP token bucket (IPv6: per /64). Configure requests/minute and burst; the defaults (600/min, burst 200) leave room for dashboards that load 100+ thumbnails at once. 429 responses carry `Retry-After`. Buckets idle for >10 min are swept automatically; the map is hard-capped at 50k entries.
 
 **Honeypot** — A list of "tripwire" URL paths. Any request matching one of them adds the source IP to the temp-ban list for the configured duration. Matching ignores case and the query string. A literal path matches anywhere in the path (`/.env` also catches `/api/.env`); a path with wildcards must match the whole path, where `*`/`?` stay inside one segment and `**` spans segments (`/backup*.zip`, `/**/phpinfo.php`). Defaults cover exposed secrets, CMS/database probes, framework diagnostics, and known appliance paths. It is OFF by default — turn it on once you've reviewed the path list.
 
@@ -153,15 +153,18 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 
 | Cloudflare field | Operator | Translates to |
 |---|---|---|
-| `http.request.uri.path` | `contains` | Honeypot path |
-| `http.request.uri.path` | `matches` | WAF rule |
+| `http.request.uri.path` | `contains` | Honeypot path (matches anywhere in the path) |
+| `http.request.uri.path` | `eq`, `in {…}` | Exact honeypot path (`=/path`) |
+| `http.request.uri.path` | `matches` | WAF rule confined to the path |
 | `http.request.uri.path` | `ne` *(inside AND)* | UA rule `except_paths` |
-| `http.request.uri.query` | `contains` | WAF rule (case-insensitive) |
-| `http.user_agent` | `contains`, `matches` | UA blocklist entry |
-| `http.host` | `contains`, `eq` | Host blocklist |
-| `ip.src` | `in {…}` | IP blocklist |
+| `http.request.uri.query`, `http.request.uri`, `http.request.full_uri` | `contains`, `matches` | WAF rule |
+| `http.user_agent` | `contains`, `matches`, `eq`, `in {…}` | UA blocklist entry |
+| `http.host` | `contains`, `eq`, `in {…}`, `matches` | Host blocklist |
+| `ip.src` | `eq`, `in {…}` (IPv4/IPv6, CIDR) | IP blocklist |
 
-Anything else (e.g. `cf.threat_score`, `ip.geoip.country`, `ssl`, method/header subfields) is reported as a warning rather than translated.
+Both operator styles work (`eq`/`==`, `and`/`&&`, `matches`/`~`, …), as do `lower()`/`upper()` wrappers and raw strings (`r"…"`). Rules a translation would make broader are not imported: honeypots ban the client, so an exact Cloudflare path stays exact. Anything Guardian can't evaluate (`cf.*` bot/threat scores, `ip.geoip.*`, `ssl`, methods, `$lists`, NOT, and most AND combinations) is reported as a warning, and regexes Go can't compile show up in the preview instead of failing on apply. Cloudflare's `contains` is case-sensitive; Guardian's imported UA, host and honeypot rules ignore case.
+
+**Exempt clients** (General) — IPs/CIDRs Guardian never blocks, bans or rate limits, e.g. your home network or VPN, so a false positive can't lock you out.
 
 **General** — Turn on **Trust Cloudflare** if any site is proxied through Cloudflare (orange cloud); otherwise Guardian sees Cloudflare's servers instead of your visitors. Configure the CIDRs of any other proxies directly in front of Zoraxy. Forwarding headers are ignored for all other peers, preventing client-IP spoofing. This tab also previews or merges the current recommended UA, WAF, and honeypot rules without replacing custom or host-scoped rules.
 

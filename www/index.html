@@ -74,14 +74,14 @@
   <section id="tab-rate" class="tab-panel">
     <h2>Per-IP rate limit</h2>
     <label><input type="checkbox" id="rate-enabled"> Enabled</label>
-    <label>Requests per minute <input type="number" id="rate-rpm" min="1" value="120"></label>
-    <label>Burst <input type="number" id="rate-burst" min="1" value="30"></label>
-    <p class="hint">Limits each source IP across protected hosts. The burst setting allows short spikes before requests are slowed down.</p>
+    <label>Requests per minute <input type="number" id="rate-rpm" min="1" value="600"></label>
+    <label>Burst <input type="number" id="rate-burst" min="1" value="200"></label>
+    <p class="hint">Limits each source IP (IPv6: each /64) across all protected hosts combined. The burst allows short spikes: opening a camera or media dashboard can fire 100+ requests at once, so keep it well above that. Blocked requests get <code>429</code> with <code>Retry-After</code>. Traffic from an untrusted proxy is never rate limited.</p>
   </section>
 
   <section id="tab-honeypot" class="tab-panel">
     <h2>Honeypot paths</h2>
-    <p class="hint">Immediately ban requests for paths your sites never use, such as <code>/.env</code>. Review the list first. Matching ignores case and the query string. A literal path matches anywhere in the path (<code>/.env</code> also catches <code>/api/.env</code>); a path with wildcards must match the whole path, where <code>*</code> stays within one segment and <code>**</code> spans segments (<code>/backup*.zip</code>, <code>/**/phpinfo.php</code>).</p>
+    <p class="hint">Immediately ban requests for paths your sites never use, such as <code>/.env</code>. Review the list first. Matching ignores case and the query string. A literal path matches anywhere in the path (<code>/.env</code> also catches <code>/api/.env</code>); <code>=/path</code> matches that exact path only; a path with wildcards must match the whole path, where <code>*</code> stays within one segment and <code>**</code> spans segments (<code>/backup*.zip</code>, <code>/**/phpinfo.php</code>).</p>
     <label><input type="checkbox" id="honeypot-enabled"> Enabled</label>
     <label>Ban duration (seconds) <input type="number" id="honeypot-ban-secs" min="60" value="3600"></label>
     <table class="scoped-table" id="honeypot-table">
@@ -102,7 +102,7 @@
 
   <section id="tab-fingerprint" class="tab-panel">
     <h2>Fingerprint tracking</h2>
-    <p class="hint">Link repeated blocked request signatures across IP changes. Enable only when you want stronger scanner detection and have reviewed the possible shared-client impact.</p>
+    <p class="hint">Catches one tool rotating IP addresses. A fingerprint (User-Agent, Accept headers, protocol, host, method and exact URL) is banned after <em>Threshold</em> attack blocks (honeypot, WAF, User-Agent or Host rules) from at least two different clients within the window. IP-list, allowlist and rate-limit blocks never count, since those requests look like any normal visitor's.</p>
     <label><input type="checkbox" id="fingerprint-enabled"> Enabled</label>
     <label>Threshold (strikes) <input type="number" id="fingerprint-threshold" min="1" value="10"></label>
     <label>Window (seconds) <input type="number" id="fingerprint-window" min="60" value="300"></label>
@@ -156,6 +156,8 @@
     <p class="hint">Forwarded client-IP headers are used only when Zoraxy's direct peer matches one of these CIDRs. Leave empty if Zoraxy receives traffic directly.</p>
     <label><input type="checkbox" id="trust-cloudflare"> Trust Cloudflare (built-in edge ranges; uses <code>CF-Connecting-IP</code>)</label>
     <p class="hint">Turn this on if any site behind Zoraxy is proxied through Cloudflare (orange cloud). Without it, Guardian sees Cloudflare's servers instead of your visitors. Guardian never bans a proxy address either way, but it can't ban the real attacker until it can see them.</p>
+    <label>Exempt clients (IP/CIDR, comma-sep) <input type="text" id="exempt-cidrs" placeholder="203.0.113.10, 192.168.1.0/24"></label>
+    <p class="hint">Never blocked, banned or rate limited by Guardian, e.g. your own network or VPN, so a false positive can't lock you out. Don't add Zoraxy's Docker network or a proxy range here; that would exempt everyone.</p>
     <label><input type="checkbox" id="ignore-zoraxy-blacklist"> Don't mirror Zoraxy's own blacklist / geo blocks into the block log</label>
     <h2>Recommended rule updates</h2>
     <p class="hint">Preview or merge this release's UA, WAF, and honeypot rules. Your custom and host-scoped rules stay unchanged.</p>

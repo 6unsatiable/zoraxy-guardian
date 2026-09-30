@@ -96,8 +96,8 @@
     renderScopedTable('hostblock-table', c.host_blocklist || []);
     renderWAF();
     $('#rate-enabled').checked = !!c.rate_limit?.enabled;
-    $('#rate-rpm').value = c.rate_limit?.requests_per_minute ?? 120;
-    $('#rate-burst').value = c.rate_limit?.burst ?? 30;
+    $('#rate-rpm').value = c.rate_limit?.requests_per_minute ?? 600;
+    $('#rate-burst').value = c.rate_limit?.burst ?? 200;
     $('#honeypot-enabled').checked = !!c.honeypot?.enabled;
     $('#honeypot-ban-secs').value = c.honeypot?.ban_seconds ?? 3600;
     renderScopedTable('honeypot-table', c.honeypot?.paths || []);
@@ -111,6 +111,7 @@
     $('#fingerprint-ban-secs').value = c.fingerprint_tracking?.ban_seconds ?? 3600;
     $('#trusted-proxy-cidrs').value = hostsToStr(c.trusted_proxy_cidrs);
     $('#trust-cloudflare').checked = !!c.trust_cloudflare;
+    $('#exempt-cidrs').value = hostsToStr(c.exempt_cidrs);
     $('#ignore-zoraxy-blacklist').checked = !!c.ignore_zoraxy_blacklist;
   }
 
@@ -134,8 +135,8 @@
       waf_rules: wafRules,
       rate_limit: {
         enabled: $('#rate-enabled').checked,
-        requests_per_minute: parseInt($('#rate-rpm').value, 10) || 120,
-        burst: parseInt($('#rate-burst').value, 10) || 30,
+        requests_per_minute: parseInt($('#rate-rpm').value, 10) || 600,
+        burst: parseInt($('#rate-burst').value, 10) || 200,
       },
       honeypot: {
         enabled: $('#honeypot-enabled').checked,
@@ -156,6 +157,7 @@
       },
       trusted_proxy_cidrs: strToHosts($('#trusted-proxy-cidrs').value) || [],
       trust_cloudflare: $('#trust-cloudflare').checked,
+      exempt_cidrs: strToHosts($('#exempt-cidrs').value) || [],
       ignore_zoraxy_blacklist: $('#ignore-zoraxy-blacklist').checked,
     };
   }

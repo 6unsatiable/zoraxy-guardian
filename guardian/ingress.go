@@ -12,6 +12,10 @@ func WriteBlockResponse(w http.ResponseWriter, d Decision) {
 	}
 	w.Header().Set("X-Guardian-Reason", d.Reason)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "60")
+	}
 	w.WriteHeader(status)
 	fmt.Fprintf(w, "%d %s\n", status, http.StatusText(status))
 }

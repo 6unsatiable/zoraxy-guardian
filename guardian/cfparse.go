@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 	"unicode"
@@ -128,6 +129,47 @@ func cfTokenize(src string) ([]cfToken, error) {
 		case c == '.':
 			out = append(out, cfToken{tkDot, ".", i})
 			i++
+		case c == ',':
+			// Cloudflare accepts commas between set members; ignore them.
+			i++
+		case c == '$':
+			return nil, fmt.Errorf("lists ($name at offset %d) can't be imported; paste the list's entries instead", i)
+		case strings.HasPrefix(src[i:], "=="), strings.HasPrefix(src[i:], "!="),
+			strings.HasPrefix(src[i:], "&&"), strings.HasPrefix(src[i:], "||"),
+			strings.HasPrefix(src[i:], "^^"), strings.HasPrefix(src[i:], ">="),
+			strings.HasPrefix(src[i:], "<="):
+			// Symbolic operators are normalized to the English ones.
+			out = append(out, cfToken{tkIdent, cfSymbolicOps[src[i:i+2]], i})
+			i += 2
+		case c == '~' || c == '!' || c == '>' || c == '<':
+			out = append(out, cfToken{tkIdent, cfSymbolicOps[string(c)], i})
+			i++
+		case c == 'r' && i+1 < len(src) && (src[i+1] == '"' || src[i+1] == '#'):
+			// Raw string: r"..." or r#"..."# (no escape processing).
+			j := i + 1
+			hashes := 0
+			for j < len(src) && src[j] == '#' {
+				hashes++
+				j++
+			}
+			if j >= len(src) || src[j] != '"' {
+				return nil, fmt.Errorf("malformed raw string at offset %d", i)
+			}
+			closing := "\"" + strings.Repeat("#", hashes)
+			end := strings.Index(src[j+1:], closing)
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated raw string at offset %d", i)
+			}
+			out = append(out, cfToken{tkString, src[j+1 : j+1+end], i})
+			i = j + 1 + end + len(closing)
+		case isHexIPv6Start(src[i:]):
+			// An IPv6 literal that starts with a letter, e.g. fe80::/10.
+			j := i
+			for j < len(src) && (isHexDigit(src[j]) || src[j] == ':' || src[j] == '.' || src[j] == '/') {
+				j++
+			}
+			out = append(out, cfToken{tkNumber, src[i:j], i})
+			i = j
 		case c == '"':
 			// String literal with backslash escapes.
 			j := i + 1
@@ -174,6 +216,25 @@ func cfTokenize(src string) ([]cfToken, error) {
 		}
 	}
 	return out, nil
+}
+
+var cfSymbolicOps = map[string]string{
+	"==": "eq", "!=": "ne", "&&": "and", "||": "or", "^^": "xor",
+	">=": "ge", "<=": "le", ">": "gt", "<": "lt", "~": "matches", "!": "not",
+}
+
+func isHexDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+// isHexIPv6Start reports whether s begins with hex digits followed by ':'
+// (an IPv6 literal like "fe80::1" that would otherwise lex as an identifier).
+func isHexIPv6Start(s string) bool {
+	j := 0
+	for j < len(s) && j < 4 && isHexDigit(s[j]) {
+		j++
+	}
+	return j > 0 && j < len(s) && s[j] == ':' && !('0' <= s[0] && s[0] <= '9')
 }
 
 // --- parser ---
@@ -288,16 +349,42 @@ func (p *cfParser) parsePrimary() (cfNode, error) {
 }
 
 func (p *cfParser) parsePredicate() (cfNode, error) {
+	// Transformation functions only change case/encoding; the rules they
+	// produce are already case-insensitive, so the wrapper is unwrapped.
+	if t, ok := p.peek(); ok && t.Kind == tkIdent && p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tkLParen {
+		switch strings.ToLower(t.Val) {
+		case "lower", "upper", "url_decode":
+			p.pos += 2
+			inner, err := p.parsePredicateField()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tkRParen, "", "')' after function argument"); err != nil {
+				return nil, err
+			}
+			return p.parseOperatorAndValue(inner)
+		default:
+			return nil, fmt.Errorf("unsupported function %s() at offset %d", t.Val, t.Pos)
+		}
+	}
+	field, err := p.parsePredicateField()
+	if err != nil {
+		return nil, err
+	}
+	return p.parseOperatorAndValue(field)
+}
+
+func (p *cfParser) parsePredicateField() (string, error) {
 	// Parse field: ident ('.' ident)* ('[' string ']')?
 	first, err := p.expect(tkIdent, "", "field name")
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	parts := []string{first.Val}
 	for p.match(tkDot, "") {
 		t, err := p.expect(tkIdent, "", "field name after '.'")
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		parts = append(parts, t.Val)
 	}
@@ -306,12 +393,22 @@ func (p *cfParser) parsePredicate() (cfNode, error) {
 	if p.match(tkLBracket, "") {
 		t, err := p.expect(tkString, "", "header name in brackets")
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		field += "[" + t.Val + "]"
 		if _, err := p.expect(tkRBracket, "", "']'"); err != nil {
-			return nil, err
+			return "", err
 		}
+	}
+	return field, nil
+}
+
+func (p *cfParser) parseOperatorAndValue(field string) (cfNode, error) {
+	// A bare boolean field (cf.client.bot, ssl) has no operator.
+	next, ok := p.peek()
+	if !ok || next.Kind == tkRParen || (next.Kind == tkIdent &&
+		(strings.EqualFold(next.Val, "and") || strings.EqualFold(next.Val, "or") || strings.EqualFold(next.Val, "xor"))) {
+		return cfPredicate{Field: field, Op: "is-true"}, nil
 	}
 
 	// Operator
@@ -320,6 +417,9 @@ func (p *cfParser) parsePredicate() (cfNode, error) {
 		return nil, err
 	}
 	op := strings.ToLower(opTok.Val)
+	if op == "strict" && p.match(tkIdent, "wildcard") {
+		op = "strict wildcard"
+	}
 
 	// Value
 	pred := cfPredicate{Field: field, Op: op}
@@ -336,6 +436,9 @@ func (p *cfParser) parsePredicate() (cfNode, error) {
 				p.advance()
 				break
 			}
+			if t.Kind == tkNumber && p.pos+2 < len(p.tokens) && p.tokens[p.pos+1].Kind == tkDot && p.tokens[p.pos+2].Kind == tkDot {
+				return nil, fmt.Errorf("port/number ranges (a..b) are not supported in 'in' sets")
+			}
 			if t.Kind != tkString && t.Kind != tkNumber && t.Kind != tkIdent {
 				return nil, fmt.Errorf("unexpected token in 'in' set: %q", t.Val)
 			}
@@ -347,6 +450,9 @@ func (p *cfParser) parsePredicate() (cfNode, error) {
 	tok, ok := p.advance()
 	if !ok {
 		return nil, fmt.Errorf("expected value after operator %q", op)
+	}
+	if tok.Kind == tkLParen || tok.Kind == tkRParen || tok.Kind == tkLBrace {
+		return nil, fmt.Errorf("expected value after operator %q at offset %d", op, tok.Pos)
 	}
 	pred.Value = tok.Val
 	return pred, nil
@@ -483,31 +589,48 @@ func translatePredicate(p cfPredicate, constraints []cfPredicate, res *CFImportR
 
 	switch {
 	case isPathField(field) && op == "contains":
-		// Path substring → honeypot path. Substring patterns also catch
-		// the existing WAF-style hits like ".." or "/etc/passwd", but a
-		// honeypot ban-on-trip is more aggressive (and more correct) for
-		// scanner paths.
+		// Path substring → honeypot path (matches anywhere in the path).
+		// Stricter than the Cloudflare rule: a honeypot hit also bans the
+		// client for the honeypot duration.
 		res.Honeypot = append(res.Honeypot, ScopedEntry{Value: val})
+	case isPathField(field) && op == "eq":
+		// Exact path → exact honeypot entry. A plain literal would match
+		// anywhere in the path and ban far more than the Cloudflare rule.
+		res.Honeypot = append(res.Honeypot, ScopedEntry{Value: "=" + val})
+	case isPathField(field) && op == "in":
+		for _, v := range p.Set {
+			res.Honeypot = append(res.Honeypot, ScopedEntry{Value: "=" + v})
+		}
 	case isPathField(field) && op == "matches":
-		// Regex against path → WAF rule, since honeypot uses literal
-		// substring matching.
-		res.WAFRules = append(res.WAFRules, WAFRule{
-			Name:    safeName("cf-path-matches", val),
-			Pattern: val,
-			Enabled: true,
-		})
-	case isPathField(field) && (op == "eq" || op == "ne"):
-		// Standalone path ne/eq predicate. Skip — it's only meaningful
-		// when AND'd with another rule (handled via constraints).
-		if op == "ne" {
+		if addRegexWarning(val, res) {
 			return
 		}
-		res.Honeypot = append(res.Honeypot, ScopedEntry{Value: val})
-	case isQueryField(field) && op == "contains":
-		// Query substring → WAF rule (case-insensitive substring).
+		// A regex over the path only: anchor it to the path segment of the
+		// WAF target (which starts with the request URI).
 		res.WAFRules = append(res.WAFRules, WAFRule{
-			Name:    safeName("cf-query-contains", val),
+			Name:    safeName("cf-path-matches", val),
+			Pattern: pathOnlyPattern(val),
+			Enabled: true,
+		})
+	case isPathField(field) && op == "ne":
+		// Standalone path ne is only meaningful as an exception inside an
+		// AND (handled via constraints).
+		res.Warnings = append(res.Warnings, "skipping standalone \"path ne\" — it only works as an exception to a user-agent rule")
+	case (isQueryField(field) || isFullURIField(field)) && op == "contains":
+		// Query / full-URI substring → WAF rule. (It used to become a
+		// honeypot path, which only sees the path and never matched.)
+		res.WAFRules = append(res.WAFRules, WAFRule{
+			Name:    safeName("cf-uri-contains", val),
 			Pattern: "(?i)" + regexp.QuoteMeta(val),
+			Enabled: true,
+		})
+	case (isQueryField(field) || isFullURIField(field)) && op == "matches":
+		if addRegexWarning(val, res) {
+			return
+		}
+		res.WAFRules = append(res.WAFRules, WAFRule{
+			Name:    safeName("cf-uri-matches", val),
+			Pattern: val,
 			Enabled: true,
 		})
 	case isUAField(field) && op == "contains":
@@ -517,38 +640,111 @@ func translatePredicate(p cfPredicate, constraints []cfPredicate, res *CFImportR
 		}
 		res.UABlocklist = append(res.UABlocklist, entry)
 	case isUAField(field) && op == "matches":
+		if addRegexWarning(val, res) {
+			return
+		}
 		entry := ScopedEntry{
 			Value:       val,
 			ExceptPaths: exceptionPaths(constraints),
 		}
 		res.UABlocklist = append(res.UABlocklist, entry)
+	case isUAField(field) && (op == "eq" || op == "in"):
+		values := p.Set
+		if op == "eq" {
+			values = []string{val}
+		}
+		for _, v := range values {
+			res.UABlocklist = append(res.UABlocklist, ScopedEntry{
+				Value:       "^" + regexp.QuoteMeta(v) + "$",
+				ExceptPaths: exceptionPaths(constraints),
+			})
+		}
 	case isHostField(field) && op == "contains":
 		res.HostBlocklist = append(res.HostBlocklist, ScopedEntry{
 			Value: "(?i)" + regexp.QuoteMeta(val),
 		})
-	case isHostField(field) && op == "eq":
-		res.HostBlocklist = append(res.HostBlocklist, ScopedEntry{
-			Value: "(?i)^" + regexp.QuoteMeta(val) + "$",
-		})
-	case field == "ip.src" && op == "in":
-		for _, v := range p.Set {
+	case isHostField(field) && (op == "eq" || op == "in"):
+		values := p.Set
+		if op == "eq" {
+			values = []string{val}
+		}
+		for _, v := range values {
+			res.HostBlocklist = append(res.HostBlocklist, ScopedEntry{
+				Value: "(?i)^" + regexp.QuoteMeta(v) + "$",
+			})
+		}
+	case isHostField(field) && op == "matches":
+		if addRegexWarning(val, res) {
+			return
+		}
+		res.HostBlocklist = append(res.HostBlocklist, ScopedEntry{Value: val})
+	case field == "ip.src" && (op == "in" || op == "eq"):
+		values := p.Set
+		if op == "eq" {
+			values = []string{val}
+		}
+		for _, v := range values {
+			if !validIPOrCIDR(v) {
+				res.Warnings = append(res.Warnings, "skipping invalid IP/CIDR \""+v+"\"")
+				continue
+			}
 			res.IPBlocklist = append(res.IPBlocklist, ScopedEntry{Value: v})
 		}
-	case strings.HasPrefix(field, "http.request.method") && op == "eq":
+	case strings.HasPrefix(field, "http.request.method"):
 		res.Warnings = append(res.Warnings,
-			"skipping method check on "+val+" — Guardian doesn't filter by HTTP method yet")
-	case strings.HasPrefix(field, "ip.geoip") || strings.HasPrefix(field, "cf.") || strings.HasPrefix(field, "ssl"):
+			"skipping method check — Guardian doesn't filter by HTTP method")
+	case strings.HasPrefix(field, "ip.geoip") || strings.HasPrefix(field, "ip.src.") ||
+		strings.HasPrefix(field, "cf.") || strings.HasPrefix(field, "ssl"):
 		res.Warnings = append(res.Warnings,
-			"skipping "+field+" "+op+" — needs Cloudflare-side signals (GeoIP / threat score / TLS) Guardian doesn't have")
+			"skipping "+field+" — needs Cloudflare-side signals (GeoIP / ASN / bot score / TLS) Guardian doesn't have")
 	default:
-		res.Warnings = append(res.Warnings,
-			"skipping unsupported predicate: "+field+" "+op+" \""+val+"\"")
+		desc := field + " " + op
+		if val != "" {
+			desc += " \"" + val + "\""
+		}
+		res.Warnings = append(res.Warnings, "skipping unsupported predicate: "+desc)
 	}
+}
+
+// addRegexWarning reports (and returns true for) a pattern Go's regexp
+// engine can't compile, so preview shows it instead of Apply failing.
+func addRegexWarning(pattern string, res *CFImportResult) bool {
+	if _, err := regexp.Compile(pattern); err != nil {
+		res.Warnings = append(res.Warnings, "skipping regex Guardian can't compile: "+pattern+" ("+err.Error()+")")
+		return true
+	}
+	return false
+}
+
+// pathOnlyPattern confines a Cloudflare path regex to the path part of the
+// WAF target, which starts with the request URI. "^" in the Cloudflare
+// regex means the start of the path.
+func pathOnlyPattern(pattern string) string {
+	if strings.HasPrefix(pattern, "(?i)") {
+		return "(?i)^[^?# ]*?(?:" + strings.TrimPrefix(strings.TrimPrefix(pattern, "(?i)"), "^") + ")"
+	}
+	if strings.HasPrefix(pattern, "^") {
+		return "^(?:" + strings.TrimPrefix(pattern, "^") + ")"
+	}
+	return "^[^?# ]*?(?:" + pattern + ")"
+}
+
+func validIPOrCIDR(v string) bool {
+	if _, _, err := net.ParseCIDR(v); err == nil {
+		return true
+	}
+	return net.ParseIP(v) != nil
 }
 
 func isPathField(f string) bool {
 	f = strings.ToLower(f)
-	return f == "http.request.uri.path" || f == "http.request.uri" || f == "http.request.full_uri"
+	return f == "http.request.uri.path"
+}
+
+// isFullURIField: http.request.uri is path+query; full_uri adds scheme+host.
+func isFullURIField(f string) bool {
+	f = strings.ToLower(f)
+	return f == "http.request.uri" || f == "http.request.full_uri"
 }
 func isQueryField(f string) bool {
 	f = strings.ToLower(f)

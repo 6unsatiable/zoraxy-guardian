@@ -42,6 +42,9 @@ type Config struct {
 	// TrustCloudflare adds Cloudflare's published edge ranges to the trusted
 	// proxies and honors CF-Connecting-IP from them.
 	TrustCloudflare bool `json:"trust_cloudflare"`
+	// ExemptCIDRs are client addresses Guardian never blocks, bans or rate
+	// limits (your own network or VPN). Checked before every other rule.
+	ExemptCIDRs []string `json:"exempt_cidrs"`
 	// IgnoreZoraxyBlacklist stops mirroring Zoraxy's own blacklist/geo hits
 	// into the block log (they can drown out Guardian's own blocks).
 	IgnoreZoraxyBlacklist bool `json:"ignore_zoraxy_blacklist"`
@@ -142,12 +145,14 @@ type Store struct {
 	wafRuleNames   []string
 	honeypotRules  []compiledGlobRule
 	trustedProxies []compiledIPRule
+	exemptRules    []compiledIPRule
 	limiter        *rateLimiter
 	log            *blockLog
 	bcast          *broadcaster
 
-	pendingMu sync.Mutex
-	pending   map[string]pendingDecision
+	pendingMu    sync.Mutex
+	pending      map[string]pendingDecision
+	pendingSwept time.Time
 
 	// Traffic that resolved to a proxy address (see isProxyAddress).
 	proxyMu      sync.Mutex
@@ -162,11 +167,20 @@ type Store struct {
 	banMu              sync.Mutex
 	bansPath           string
 	bansDirty          bool
-	tempBans           map[string]time.Time   // IP -> expiry
-	strikes            map[string][]time.Time // IP -> recent strike timestamps
-	fingerprintBans    map[string]time.Time   // Fingerprint -> expiry
-	fingerprintStrikes map[string][]time.Time // Fingerprint -> strike timestamps
+	tempBans           map[string]time.Time            // IP -> expiry
+	strikes            map[string][]time.Time          // IP -> recent strike timestamps
+	fingerprintBans    map[string]time.Time            // Fingerprint -> expiry
+	fingerprintStrikes map[string][]time.Time          // Fingerprint -> strike timestamps
+	fingerprintSources map[string]map[string]time.Time // Fingerprint -> ban key -> last strike
 }
+
+// A fingerprint is only banned once it has struck from this many different
+// clients: the feature exists to catch one tool rotating addresses, and a
+// single address is already handled by the IP auto-ban.
+const (
+	minFingerprintSources = 2
+	maxFingerprintSources = 16
+)
 
 const (
 	maxPendingDecisions = 10000
@@ -216,6 +230,7 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		strikes:            make(map[string][]time.Time),
 		fingerprintBans:    make(map[string]time.Time),
 		fingerprintStrikes: make(map[string][]time.Time),
+		fingerprintSources: make(map[string]map[string]time.Time),
 		logThrottle:        make(map[string]time.Time),
 		bansPath:           filepath.Join(filepath.Dir(configPath), "bans.json"),
 		bcast:              newBroadcaster(),
@@ -302,18 +317,28 @@ func removeUnscopedEntries(entries *[]ScopedEntry, values []string) int {
 	return removed
 }
 
+// legacyWAFPatterns lists earlier built-in rules by name. A rule still
+// carrying one of these exact patterns (unscoped, unedited) is replaced by
+// the current default on a recommended-rule merge.
+var legacyWAFPatterns = map[string][]string{
+	"sqli-comment":       {`(?i)(--|#|/\*).*(\bor\b|\band\b)`},
+	"xss-script":         {`(?i)<script\b`},
+	"xss-javascript-uri": {`(?i)javascript:`},
+	"xss-onevent":        {`(?i)\bon\w+\s*=`},
+	"null-byte":          {`%00`, `(?i)%00`},
+	// v0.2-v0.3 defaults that blocked ordinary traffic: any "on…=" parameter
+	// or cookie (?only=, ?online=, onboarding=1), and any URL with "--"
+	// followed later by the word "and"/"or" (slugs, searches, JWT cookies).
+	"xss-pattern":          {`(?i)(<script\b|javascript:|\bon\w+\s*=)`},
+	"sqli-boolean-comment": {`(?i)(--|#|/\*).*(\bor\b|\band\b)`},
+	"command-injection":    {`(?i)(;|\|\||&&|%0a|%0d)(\s|%20)*(curl|wget|bash|sh|cmd|powershell|nc|netcat)\b`},
+}
+
 func removeLegacyWAFRules(rules *[]WAFRule) int {
-	legacy := map[string]string{
-		"sqli-comment":       `(?i)(--|#|/\*).*(\bor\b|\band\b)`,
-		"xss-script":         `(?i)<script\b`,
-		"xss-javascript-uri": `(?i)javascript:`,
-		"xss-onevent":        `(?i)\bon\w+\s*=`,
-		"null-byte":          `%00`, // superseded by the case-insensitive `(?i)%00`
-	}
 	out := (*rules)[:0]
 	removed := 0
 	for _, rule := range *rules {
-		if pattern, ok := legacy[rule.Name]; ok && rule.Pattern == pattern && rule.Enabled && len(rule.Hosts) == 0 {
+		if isLegacyWAFRule(rule) {
 			removed++
 			continue
 		}
@@ -321,6 +346,18 @@ func removeLegacyWAFRules(rules *[]WAFRule) int {
 	}
 	*rules = out
 	return removed
+}
+
+func isLegacyWAFRule(rule WAFRule) bool {
+	if !rule.Enabled || len(rule.Hosts) != 0 {
+		return false
+	}
+	for _, pattern := range legacyWAFPatterns[rule.Name] {
+		if rule.Pattern == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeRecommendedWAF(target *[]WAFRule, incoming []WAFRule) int {
@@ -352,6 +389,12 @@ func mergeDefaults(c Config) Config {
 	if c.HostBlocklist == nil {
 		c.HostBlocklist = []ScopedEntry{}
 	}
+	if c.ExemptCIDRs == nil {
+		c.ExemptCIDRs = []string{}
+	}
+	if c.TrustedProxyCIDRs == nil {
+		c.TrustedProxyCIDRs = []string{}
+	}
 	if c.UABlocklist == nil {
 		c.UABlocklist = []ScopedEntry{
 			// Keep scanner signatures grouped by purpose so the default policy
@@ -364,22 +407,33 @@ func mergeDefaults(c Config) Config {
 	if c.WAFRules == nil {
 		c.WAFRules = []WAFRule{
 			{Name: "sqli-union", Pattern: `(?i)union[\s/*]+select`, Enabled: true},
-			{Name: "sqli-boolean-comment", Pattern: `(?i)(--|#|/\*).*(\bor\b|\band\b)`, Enabled: true},
+			// A quote closed and followed by a comment (admin'--), a quote then
+			// OR/AND (' or '1'='1), or a numeric tautology (or 1=1). Plain
+			// text like "rock and roll -- live" doesn't match.
+			{Name: "sqli-boolean-comment", Pattern: `(?i)('\s*(--|#|/\*)|['"]\s*\b(or|and)\b\s*['"\d(]|\b(or|and)\b\s+\d+\s*(=|<|>|like)\s*\d+)`, Enabled: true},
 			{Name: "sqli-time-based", Pattern: `(?i)\b(sleep|benchmark|pg_sleep)\s*\(`, Enabled: true},
-			{Name: "xss-pattern", Pattern: `(?i)(<script\b|javascript:|\bon\w+\s*=)`, Enabled: true},
+			// Script-capable tags, javascript: URIs, and real DOM event
+			// handlers (not every parameter that happens to start with "on").
+			{Name: "xss-pattern", Pattern: `(?i)(<(script|iframe|object|embed)\b|javascript:|\bon(error|load|click|dblclick|mouse(over|out|down|up|move|enter|leave)|focus(in|out)?|blur|submit|change|input|key(down|up|press)|animation(start|end|iteration)|transition(start|end|run)|pointer(over|enter|down|up|move)|toggle|begin|wheel|scroll|drag(start|end|over)?|drop|copy|cut|paste|beforeunload|unload|hashchange|message|resize|abort|playing|touchstart|auxclick|contextmenu)\s*=)`, Enabled: true},
 			{Name: "path-traversal", Pattern: `(\.\./|\.\.\\)`, Enabled: true},
-			{Name: "null-byte", Pattern: `(?i)%00`, Enabled: true},
-			{Name: "command-injection", Pattern: `(?i)(;|\|\||&&|%0a|%0d)(\s|%20)*(curl|wget|bash|sh|cmd|powershell|nc|netcat)\b`, Enabled: true},
+			{Name: "null-byte", Pattern: `(%00|\x00)`, Enabled: true},
+			// A shell separator or substitution, then a download/shell tool
+			// used as a command (followed by a space or the end), so a cookie
+			// named "nc=" after "; " doesn't count.
+			{Name: "command-injection", Pattern: `(?i)(;|\|\||&&|\||%0a|%0d|\$\(|` + "`" + `)(\s|%20|\+)*(curl|wget|bash|sh|cmd|powershell|nc|netcat|python3?|perl)(\s|%20|\+|$)`, Enabled: true},
 			{Name: "log4shell", Pattern: `(?i)\$\{jndi:[^}]+\}`, Enabled: true},
 			{Name: "dangerous-uri-scheme", Pattern: `(?i)(php|file|expect)://`, Enabled: true},
 			{Name: "ssrf-metadata", Pattern: `(?i)(169\.254\.169\.254|metadata\.google\.internal|metadata\.azure\.com|fd00:ec2::254)`, Enabled: true},
 		}
 	}
+	// Sized for modern web apps: opening a camera or media dashboard fires
+	// 100+ requests at once (thumbnails, API calls), which a burst of 30
+	// turned into 429s for the owner.
 	if c.RateLimit.RequestsPerMinute == 0 {
-		c.RateLimit.RequestsPerMinute = 120
+		c.RateLimit.RequestsPerMinute = 600
 	}
 	if c.RateLimit.Burst == 0 {
-		c.RateLimit.Burst = 30
+		c.RateLimit.Burst = 200
 	}
 	if c.Honeypot.Paths == nil {
 		c.Honeypot.Paths = []ScopedEntry{
@@ -464,6 +518,7 @@ func (s *Store) compile() {
 	if s.cfg.RateLimit.Enabled {
 		s.limiter = newRateLimiter(s.cfg.RateLimit.RequestsPerMinute, s.cfg.RateLimit.Burst)
 	}
+	s.exemptRules = compileIPRules(scopedEntries(s.cfg.ExemptCIDRs))
 	s.trustedProxies = compileIPRules(scopedEntries(s.cfg.TrustedProxyCIDRs))
 	if s.cfg.TrustCloudflare {
 		s.trustedProxies = append(s.trustedProxies, cloudflareRules...)
@@ -525,8 +580,9 @@ func compileUARules(entries []ScopedEntry) []compiledUARule {
 // compileGlobRules compiles honeypot paths, case-insensitively (scanners
 // vary case and most app servers don't care). A value without wildcards
 // matches anywhere in the request path as a literal, so "/.env" catches
-// "/api/.env" too. A value with wildcards must match the whole path: `*` and
-// `?` stay within one path segment, `**` crosses segments.
+// "/api/.env" too. A value starting with "=" must equal the whole path
+// ("=/login" matches only /login). A value with wildcards must match the
+// whole path: `*` and `?` stay within one path segment, `**` crosses segments.
 func compileGlobRules(entries []ScopedEntry) []compiledGlobRule {
 	out := make([]compiledGlobRule, 0, len(entries))
 	for _, e := range entries {
@@ -536,7 +592,9 @@ func compileGlobRules(entries []ScopedEntry) []compiledGlobRule {
 		}
 		var re *regexp.Regexp
 		var err error
-		if !strings.ContainsAny(val, "*?") {
+		if exact, ok := strings.CutPrefix(val, "="); ok {
+			re = regexp.MustCompile("(?i)^" + regexp.QuoteMeta(exact) + "$")
+		} else if !strings.ContainsAny(val, "*?") {
 			re = regexp.MustCompile("(?i)" + regexp.QuoteMeta(val))
 		} else {
 			re, err = regexp.Compile("(?i)" + pathGlobToRegex(val))
@@ -582,6 +640,7 @@ func (s *Store) Snapshot() Config {
 	cfg.WAFRules = append([]WAFRule{}, s.cfg.WAFRules...)
 	cfg.Honeypot.Paths = append([]ScopedEntry{}, s.cfg.Honeypot.Paths...)
 	cfg.TrustedProxyCIDRs = append([]string{}, s.cfg.TrustedProxyCIDRs...)
+	cfg.ExemptCIDRs = append([]string{}, s.cfg.ExemptCIDRs...)
 	return cfg
 }
 
@@ -626,6 +685,9 @@ func validateConfig(cfg Config) error {
 		return err
 	}
 	if err := validateCIDRs("trusted proxy", cfg.TrustedProxyCIDRs); err != nil {
+		return err
+	}
+	if err := validateIPEntries("exempt", scopedEntries(cfg.ExemptCIDRs)); err != nil {
 		return err
 	}
 	for i, r := range cfg.WAFRules {
@@ -738,10 +800,15 @@ func (s *Store) RecordDecision(uuid string, d Decision) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	now := time.Now()
-	for id, pending := range s.pending {
-		if now.Sub(pending.created) > pendingDecisionTTL {
-			delete(s.pending, id)
+	// Sweeping walks the whole map, so do it periodically (or when full)
+	// rather than on every block during a flood.
+	if len(s.pending) >= maxPendingDecisions || now.Sub(s.pendingSwept) > 10*time.Second {
+		for id, pending := range s.pending {
+			if now.Sub(pending.created) > pendingDecisionTTL {
+				delete(s.pending, id)
+			}
 		}
+		s.pendingSwept = now
 	}
 	if len(s.pending) >= maxPendingDecisions {
 		return
@@ -1158,6 +1225,7 @@ func (s *Store) banSweepLoop() {
 		for fp, hist := range s.fingerprintStrikes {
 			if len(hist) == 0 || now.Sub(hist[len(hist)-1]) > 10*time.Minute {
 				delete(s.fingerprintStrikes, fp)
+				delete(s.fingerprintSources, fp)
 			}
 		}
 		s.banMu.Unlock()
@@ -1273,9 +1341,11 @@ func (s *Store) AddFingerprintBan(fp string, dur time.Duration) {
 	}
 }
 
-// RecordFingerprintStrike adds a block strike for a fingerprint signature.
-// If strikes cross the threshold, the fingerprint gets temp-banned.
-func (s *Store) RecordFingerprintStrike(fp string) time.Duration {
+// RecordFingerprintStrike adds a block strike for a fingerprint signature
+// seen from client source (a ban key). The fingerprint is temp-banned once it
+// has Threshold strikes within the window from at least
+// minFingerprintSources different clients.
+func (s *Store) RecordFingerprintStrike(fp, source string) time.Duration {
 	if fp == "" {
 		return 0
 	}
@@ -1290,7 +1360,7 @@ func (s *Store) RecordFingerprintStrike(fp string) time.Duration {
 
 	s.banMu.Lock()
 	hist, tracked := s.fingerprintStrikes[fp]
-	if !tracked && !roomForKey(len(s.fingerprintStrikes), func() { pruneStrikes(s.fingerprintStrikes, cutoff) }, func() int { return len(s.fingerprintStrikes) }) {
+	if !tracked && !roomForKey(len(s.fingerprintStrikes), func() { s.pruneFingerprintStrikesLocked(cutoff) }, func() int { return len(s.fingerprintStrikes) }) {
 		s.banMu.Unlock()
 		return 0
 	}
@@ -1304,18 +1374,43 @@ func (s *Store) RecordFingerprintStrike(fp string) time.Duration {
 	keep = append(keep, now)
 	s.fingerprintStrikes[fp] = keep
 	count := len(keep)
+
+	sources := s.fingerprintSources[fp]
+	if sources == nil {
+		sources = make(map[string]time.Time)
+		s.fingerprintSources[fp] = sources
+	}
+	for k, t := range sources {
+		if !t.After(cutoff) {
+			delete(sources, k)
+		}
+	}
+	if _, ok := sources[source]; ok || len(sources) < maxFingerprintSources {
+		sources[source] = now
+	}
+	distinct := len(sources)
 	s.banMu.Unlock()
 
-	if count >= cfg.Threshold {
+	if count >= cfg.Threshold && distinct >= minFingerprintSources {
 		dur := time.Duration(cfg.BanSeconds) * time.Second
 		s.AddFingerprintBan(fp, dur)
 		// Reset strikes once promoted
 		s.banMu.Lock()
 		delete(s.fingerprintStrikes, fp)
+		delete(s.fingerprintSources, fp)
 		s.banMu.Unlock()
 		return dur
 	}
 	return 0
+}
+
+func (s *Store) pruneFingerprintStrikesLocked(cutoff time.Time) {
+	for fp, hist := range s.fingerprintStrikes {
+		if len(hist) == 0 || !hist[len(hist)-1].After(cutoff) {
+			delete(s.fingerprintStrikes, fp)
+			delete(s.fingerprintSources, fp)
+		}
+	}
 }
 
 // FingerprintBansSnapshot returns a copy of the current fingerprint ban map.
@@ -1337,6 +1432,7 @@ func (s *Store) ClearFingerprintBan(fp string) {
 	s.banMu.Lock()
 	delete(s.fingerprintBans, fp)
 	delete(s.fingerprintStrikes, fp)
+	delete(s.fingerprintSources, fp)
 	s.bansDirty = true
 	s.banMu.Unlock()
 	_ = s.SaveBans()

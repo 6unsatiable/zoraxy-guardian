@@ -36,6 +36,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	s.mu.RLock()
 	host := req.Host
 	trustedProxies := s.trustedProxies
+	exemptRules := s.exemptRules
 	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	honeypotEnabled := s.cfg.Honeypot.Enabled
 	honeypotBanSecs := s.cfg.Honeypot.BanSeconds
@@ -51,6 +52,9 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 
 	ip := clientIP(req, trustedProxies)
 	parsedIP := net.ParseIP(ip)
+	if parsedIP != nil && ipInRules(parsedIP, exemptRules) {
+		return Decision{Block: false, IP: ip}
+	}
 	viaProxy := isProxyAddress(parsedIP, trustedProxies)
 	if viaProxy {
 		s.noteUntrustedProxy(ip, host)
@@ -65,12 +69,17 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	block := func(reason string, status int) Decision {
 		return Decision{Block: true, Reason: reason, Status: status, IP: ip}
 	}
-	strike := func() {
+	// strike counts a block towards the IP auto-ban. Only blocks caused by
+	// the request's own content (attack signatures) also count against its
+	// fingerprint: an IP-, allowlist- or rate-limit block says nothing about
+	// the request, and its browser-like fingerprint is shared with innocent
+	// visitors.
+	strike := func(signature bool) {
 		if !viaProxy {
 			s.RecordStrike(key)
 		}
-		if fpEnabled && fingerprint != "" {
-			s.RecordFingerprintStrike(fingerprint)
+		if signature && fpEnabled && fingerprint != "" {
+			s.RecordFingerprintStrike(fingerprint, key)
 		}
 	}
 
@@ -95,7 +104,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 				continue
 			}
 			if r.Net.Contains(parsedIP) {
-				strike()
+				strike(false)
 				return block("ip-blocklist", http.StatusForbidden)
 			}
 		}
@@ -107,7 +116,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			continue
 		}
 		if r.RE.MatchString(host) {
-			strike()
+			strike(true)
 			return block("host-blocklist", http.StatusForbidden)
 		}
 	}
@@ -122,6 +131,9 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			if r.RE.MatchString(path) {
 				if !viaProxy {
 					s.AddTempBan(key, time.Duration(honeypotBanSecs)*time.Second)
+				}
+				if fpEnabled && fingerprint != "" {
+					s.RecordFingerprintStrike(fingerprint, key)
 				}
 				return block("honeypot", http.StatusForbidden)
 			}
@@ -146,7 +158,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			}
 		}
 		if !allowed {
-			strike()
+			strike(false)
 			return block("not-allowlisted", http.StatusForbidden)
 		}
 	}
@@ -161,21 +173,21 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			continue
 		}
 		if r.RE.MatchString(ua) {
-			strike()
+			strike(true)
 			return block("ua-blocklist", http.StatusForbidden)
 		}
 	}
 
 	// 8. WAF rules
 	if hit := wafCheck(req, host, wafRules, wafNames); hit != "" {
-		strike()
+		strike(true)
 		return block("waf-"+hit, http.StatusForbidden)
 	}
 
 	// 9. Rate limit
 	if limiter != nil && parsedIP != nil && !viaProxy {
 		if !limiter.allow(key) {
-			strike()
+			strike(false)
 			return block("rate-limit", http.StatusTooManyRequests)
 		}
 	}

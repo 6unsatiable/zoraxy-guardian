@@ -10,7 +10,7 @@
       "url": "https://github.com/6unsatiable/zoraxy-guardian",
       "type": 0,
       "version_major": 0,
-      "version_minor": 3,
+      "version_minor": 4,
       "version_patch": 0,
       "static_capture_paths": null,
       "static_capture_ingress": "",
@@ -25,15 +25,15 @@
       "permitted_api_endpoints": null
     },
     "DownloadURLs": {
-      "linux_386": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/linux_386_guardian",
-      "linux_amd64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/linux_amd64_guardian",
-      "linux_arm": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/linux_arm_guardian",
-      "linux_arm64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/linux_arm64_guardian",
-      "linux_mipsle": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/linux_mipsle_guardian",
-      "linux_riscv64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/linux_riscv64_guardian",
-      "darwin_amd64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/darwin_amd64_guardian",
-      "darwin_arm64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/darwin_arm64_guardian",
-      "windows_amd64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.3.0/windows_amd64_guardian.exe"
+      "linux_386": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/linux_386_guardian",
+      "linux_amd64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/linux_amd64_guardian",
+      "linux_arm": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/linux_arm_guardian",
+      "linux_arm64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/linux_arm64_guardian",
+      "linux_mipsle": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/linux_mipsle_guardian",
+      "linux_riscv64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/linux_riscv64_guardian",
+      "darwin_amd64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/darwin_amd64_guardian",
+      "darwin_arm64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/darwin_arm64_guardian",
+      "windows_amd64": "https://github.com/6unsatiable/zoraxy-guardian/releases/download/v0.4.0/windows_amd64_guardian.exe"
     }
   }
 ]

@@ -33,7 +33,7 @@ func main() {
 		URL:           "https://github.com/6unsatiable/zoraxy-guardian",
 		Type:          plugin.PluginType_Router,
 		VersionMajor:  0,
-		VersionMinor:  3,
+		VersionMinor:  4,
 		VersionPatch:  0,
 
 		DynamicCaptureSniff:   DynamicSniffIngress,
