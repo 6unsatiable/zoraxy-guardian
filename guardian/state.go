@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/corazawaf/coraza/v3"
+
 	plugin "example.com/guardian/mod/zoraxy_plugin"
 )
 
@@ -48,7 +50,19 @@ type Config struct {
 	// IgnoreZoraxyBlacklist stops mirroring Zoraxy's own blacklist/geo hits
 	// into the block log (they can drown out Guardian's own blocks).
 	IgnoreZoraxyBlacklist bool `json:"ignore_zoraxy_blacklist"`
+
+	WAFEngine     WAFEngine     `json:"waf_engine"`
+	BotProtection BotProtection `json:"bot_protection"`
+	Challenge     Challenge     `json:"challenge"`
+	ThreatFeeds   ThreatFeeds   `json:"threat_feeds"`
+	Behavior      Behavior      `json:"behavior"`
+	// Version of the defaults this config was last upgraded with; lets new
+	// features default to on for existing installs exactly once.
+	DefaultsVersion int `json:"defaults_version"`
 }
+
+// currentDefaultsVersion: 1 = v1.0 (CRS, bots, challenge, feeds, behavior).
+const currentDefaultsVersion = 1
 
 type WAFRule struct {
 	Name    string   `json:"name"`
@@ -134,21 +148,27 @@ type Store struct {
 	configPath string
 	logPath    string
 
-	mu             sync.RWMutex
-	configMu       sync.Mutex
-	cfg            Config
-	allowRules     []compiledIPRule
-	blockRules     []compiledIPRule
-	uaRules        []compiledUARule
-	hostBlockRules []compiledRegexRule
-	wafRules       []compiledRegexRule
-	wafRuleNames   []string
-	honeypotRules  []compiledGlobRule
-	trustedProxies []compiledIPRule
-	exemptRules    []compiledIPRule
-	limiter        *rateLimiter
-	log            *blockLog
-	bcast          *broadcaster
+	mu              sync.RWMutex
+	configMu        sync.Mutex
+	cfg             Config
+	allowRules      []compiledIPRule
+	blockRules      []compiledIPRule
+	uaRules         []compiledUARule
+	hostBlockRules  []compiledRegexRule
+	wafRules        []compiledRegexRule
+	wafRuleNames    []string
+	honeypotRules   []compiledGlobRule
+	trustedProxies  []compiledIPRule
+	exemptRules     []compiledIPRule
+	limiter         *rateLimiter
+	challengeHosts  []string
+	challengeExempt []compiledGlobRule
+	appUARules      []compiledRegexRule
+	crs             coraza.WAF
+	crsCfg          string
+	crsErr          string
+	log             *blockLog
+	bcast           *broadcaster
 
 	pendingMu    sync.Mutex
 	pending      map[string]pendingDecision
@@ -162,6 +182,11 @@ type Store struct {
 	logThrottleMu sync.Mutex
 	logThrottle   map[string]time.Time
 	suppressed    int64
+
+	secret   []byte
+	bots     *botVerifier
+	feeds    *feedManager
+	behavior *behaviorTracker
 
 	// Temporary bans + strike tracking (separate mutex; hot path).
 	banMu              sync.Mutex
@@ -219,7 +244,18 @@ type Decision struct {
 	Reason string
 	Status int
 	IP     string // resolved client address the decision was made for
+	// Kind is KindBlock (default), KindChallenge or KindRedirect; the latter
+	// two carry their own Body/Headers.
+	Kind    string
+	Body    []byte
+	Headers map[string]string
 }
+
+const (
+	KindBlock     = ""
+	KindChallenge = "challenge"
+	KindRedirect  = "redirect"
+)
 
 func LoadState(configPath, logPath string) (*Store, error) {
 	s := &Store{
@@ -234,7 +270,11 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		logThrottle:        make(map[string]time.Time),
 		bansPath:           filepath.Join(filepath.Dir(configPath), "bans.json"),
 		bcast:              newBroadcaster(),
+		bots:               newBotVerifier(),
+		feeds:              newFeedManager(filepath.Dir(configPath)),
+		behavior:           newBehaviorTracker(),
 	}
+	s.secret = loadSecret(filepath.Join(filepath.Dir(configPath), "challenge.key"))
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -257,6 +297,7 @@ func LoadState(configPath, logPath string) (*Store, error) {
 	s.log = log
 	s.loadBans()
 	go s.banSweepLoop()
+	go s.feedLoop()
 	return s, nil
 }
 
@@ -481,6 +522,56 @@ func mergeDefaults(c Config) Config {
 	if c.FingerprintTracking.BanSeconds == 0 {
 		c.FingerprintTracking.BanSeconds = 3600 // 1 hour ban
 	}
+	if c.DefaultsVersion < 1 {
+		// v1.0 features start enabled. Challenge hosts stay empty: which
+		// sites are browser-facing is the operator's call.
+		c.WAFEngine.Enabled = true
+		c.BotProtection = BotProtection{Enabled: true, BlockAIScrapers: true, BlockSEOCrawlers: true,
+			BlockHeadless: true, VerifySearchEngines: true, BlockHTTPLibraries: true, BlockFakeBrowsers: true}
+		c.Challenge.Enabled = true
+		c.ThreatFeeds.Enabled = true
+		c.Behavior.Enabled = true
+		c.DefaultsVersion = currentDefaultsVersion
+	}
+	if c.WAFEngine.ParanoiaLevel == 0 {
+		c.WAFEngine.ParanoiaLevel = 1
+	}
+	if c.WAFEngine.AnomalyThreshold == 0 {
+		c.WAFEngine.AnomalyThreshold = 5
+	}
+	if c.WAFEngine.Exclusions == nil {
+		c.WAFEngine.Exclusions = []WAFExclusion{}
+	}
+	if c.Challenge.Hosts == nil {
+		c.Challenge.Hosts = []string{}
+	}
+	if c.Challenge.Difficulty == 0 {
+		c.Challenge.Difficulty = 16
+	}
+	if c.Challenge.CookieHours == 0 {
+		c.Challenge.CookieHours = 168
+	}
+	if c.Challenge.ExemptPaths == nil {
+		c.Challenge.ExemptPaths = scopedEntries(defaultChallengeExemptPaths)
+	}
+	if c.Challenge.AppUserAgents == nil {
+		c.Challenge.AppUserAgents = []ScopedEntry{}
+	}
+	if c.ThreatFeeds.URLs == nil {
+		c.ThreatFeeds.URLs = append([]string{}, defaultFeedURLs...)
+	}
+	if c.ThreatFeeds.RefreshHours == 0 {
+		c.ThreatFeeds.RefreshHours = 12
+	}
+	if c.Behavior.MaxPaths == 0 {
+		c.Behavior.MaxPaths = 40
+	}
+	if c.Behavior.WindowSeconds == 0 {
+		c.Behavior.WindowSeconds = 60
+	}
+	if c.Behavior.BanSeconds == 0 {
+		c.Behavior.BanSeconds = 600
+	}
 	return c
 }
 
@@ -523,6 +614,42 @@ func (s *Store) compile() {
 	if s.cfg.TrustCloudflare {
 		s.trustedProxies = append(s.trustedProxies, cloudflareRules...)
 	}
+
+	s.challengeHosts = s.cfg.Challenge.Hosts
+	s.challengeExempt = compilePrefixRules(s.cfg.Challenge.ExemptPaths)
+	s.appUARules = compileRegexRules(s.cfg.Challenge.AppUserAgents)
+
+	// Loading CRS takes a second or two; only rebuild when its settings change.
+	crsKey, _ := json.Marshal(s.cfg.WAFEngine)
+	if !s.cfg.WAFEngine.Enabled {
+		s.crs, s.crsCfg, s.crsErr = nil, "", ""
+	} else if string(crsKey) != s.crsCfg {
+		waf, err := newCRS(s.cfg.WAFEngine)
+		if err != nil {
+			s.crsErr = err.Error()
+			s.crs = nil
+		} else {
+			s.crs, s.crsErr = waf, ""
+		}
+		s.crsCfg = string(crsKey)
+	}
+	if s.feeds != nil {
+		s.feeds.trigger()
+	}
+}
+
+// compilePrefixRules matches request paths that start with the entry
+// (case-insensitive). A trailing "*" is allowed and ignored.
+func compilePrefixRules(entries []ScopedEntry) []compiledGlobRule {
+	out := make([]compiledGlobRule, 0, len(entries))
+	for _, e := range entries {
+		v := strings.TrimSuffix(e.Value, "*")
+		if v == "" {
+			continue
+		}
+		out = append(out, compiledGlobRule{RE: regexp.MustCompile("(?i)^" + regexp.QuoteMeta(v)), Hosts: e.Hosts})
+	}
+	return out
 }
 
 func scopedEntries(values []string) []ScopedEntry {
@@ -641,6 +768,11 @@ func (s *Store) Snapshot() Config {
 	cfg.Honeypot.Paths = append([]ScopedEntry{}, s.cfg.Honeypot.Paths...)
 	cfg.TrustedProxyCIDRs = append([]string{}, s.cfg.TrustedProxyCIDRs...)
 	cfg.ExemptCIDRs = append([]string{}, s.cfg.ExemptCIDRs...)
+	cfg.WAFEngine.Exclusions = append([]WAFExclusion{}, s.cfg.WAFEngine.Exclusions...)
+	cfg.Challenge.Hosts = append([]string{}, s.cfg.Challenge.Hosts...)
+	cfg.Challenge.ExemptPaths = append([]ScopedEntry{}, s.cfg.Challenge.ExemptPaths...)
+	cfg.Challenge.AppUserAgents = append([]ScopedEntry{}, s.cfg.Challenge.AppUserAgents...)
+	cfg.ThreatFeeds.URLs = append([]string{}, s.cfg.ThreatFeeds.URLs...)
 	return cfg
 }
 
@@ -709,6 +841,34 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.FingerprintTracking.Enabled && (cfg.FingerprintTracking.Threshold < 1 || cfg.FingerprintTracking.WindowSeconds < 1 || cfg.FingerprintTracking.BanSeconds < 1) {
 		return fmt.Errorf("fingerprint threshold, window, and duration must be positive")
+	}
+	if err := validateWAFEngine(cfg.WAFEngine); err != nil {
+		return err
+	}
+	if cfg.Challenge.Difficulty < 8 || cfg.Challenge.Difficulty > 24 {
+		return fmt.Errorf("challenge difficulty must be 8-24")
+	}
+	if cfg.Challenge.CookieHours < 1 {
+		return fmt.Errorf("challenge cookie lifetime must be positive")
+	}
+	for i, e := range cfg.Challenge.ExemptPaths {
+		if !strings.HasPrefix(e.Value, "/") {
+			return fmt.Errorf("challenge exempt path %d must start with /", i+1)
+		}
+	}
+	if err := validateRegexEntries("challenge app user agent", cfg.Challenge.AppUserAgents); err != nil {
+		return err
+	}
+	for i, u := range cfg.ThreatFeeds.URLs {
+		if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
+			return fmt.Errorf("threat feed %d must be an http(s) URL", i+1)
+		}
+	}
+	if cfg.ThreatFeeds.RefreshHours < 1 {
+		return fmt.Errorf("threat feed refresh must be at least 1 hour")
+	}
+	if cfg.Behavior.Enabled && (cfg.Behavior.MaxPaths < 5 || cfg.Behavior.WindowSeconds < 1 || cfg.Behavior.BanSeconds < 1) {
+		return fmt.Errorf("behavior max paths must be at least 5, window and ban positive")
 	}
 	return nil
 }
@@ -867,6 +1027,12 @@ func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 		if !s.shouldLogRepeat("fp:" + entry.Fingerprint) {
 			return
 		}
+	case "challenge", "challenge-failed", "threat-feed", "fake-browser":
+		if !s.shouldLogRepeat(d.Reason + ":" + banKey(ip)) {
+			return
+		}
+	case "challenge-passed":
+		return
 	}
 
 	s.LogEntry(entry)

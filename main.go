@@ -29,11 +29,11 @@ func main() {
 		Name:          "Guardian",
 		Author:        "6unsatiable",
 		AuthorContact: "articrevised@gmail.com",
-		Description:   "Dynamic-capture security plugin with scoped IP and UA rules, WAF patterns, rate limiting, honeypots, and auto-bans. Cloudflare-aware.",
+		Description:   "WAF and bot blocker for Zoraxy: OWASP Core Rule Set, browser proof-of-work challenge, AI/SEO crawler and fake-browser blocking, threat feeds, scoped IP/UA rules, rate limiting, honeypots and auto-bans. Cloudflare-aware.",
 		URL:           "https://github.com/6unsatiable/zoraxy-guardian",
 		Type:          plugin.PluginType_Router,
-		VersionMajor:  0,
-		VersionMinor:  4,
+		VersionMajor:  1,
+		VersionMinor:  0,
 		VersionPatch:  0,
 
 		DynamicCaptureSniff:   DynamicSniffIngress,
@@ -69,10 +69,11 @@ func main() {
 		uuid := r.Header.Get("X-Zoraxy-RequestID")
 		decision, ok := store.TakeDecision(uuid)
 		if !ok {
+			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "blocked", http.StatusForbidden)
 			return
 		}
-		guardian.WriteBlockResponse(w, decision)
+		guardian.WriteBlockResponse(w, r, decision)
 	})
 
 	store.RegisterEventRoutes(http.DefaultServeMux)

@@ -88,8 +88,11 @@
     });
   }
 
+  const PROTECTION_KEYS = ['waf_engine', 'bot_protection', 'challenge', 'threat_feeds', 'behavior'];
   function applyToUI(c) {
     cfg = c;
+    $('#protection-json').value = JSON.stringify(
+      Object.fromEntries(PROTECTION_KEYS.map((k) => [k, c[k]])), null, 2);
     renderScopedTable('ip-allow-table', c.ip_allowlist);
     renderScopedTable('ip-block-table', c.ip_blocklist);
     renderScopedTable('ua-table', c.ua_blocklist, { exceptPaths: true });
@@ -127,7 +130,10 @@
       if (!rule.hosts) delete rule.hosts;
       if (rule.name || rule.pattern) wafRules.push(rule);
     });
+    const prot = JSON.parse($('#protection-json').value || '{}');
     return {
+      ...cfg,
+      ...prot,
       ip_allowlist: readScopedTable('ip-allow-table'),
       ip_blocklist: readScopedTable('ip-block-table'),
       ua_blocklist: readScopedTable('ua-table'),
@@ -171,7 +177,8 @@
   }
 
   async function saveConfig() {
-    const body = collectUI();
+    let body;
+    try { body = collectUI(); } catch (e) { setStatus('Protection JSON: ' + e.message, true); return; }
     setStatus('Saving…');
     const r = await fetch('./api/config', {
       method: 'POST',
@@ -195,6 +202,11 @@
     const r = await fetch('./api/status', { headers: { 'X-CSRF-Token': csrfToken } });
     if (!r.ok) return;
     const st = await r.json();
+    const w = st.waf_engine || {}, f = st.feeds || {};
+    $('#protection-status').textContent =
+      'Core Rule Set: ' + (w.loaded ? 'loaded' : 'off') + (w.error ? ' (' + w.error + ')' : '') +
+      ' · Threat feeds: ' + (f.ranges || 0) + ' ranges · AI bot list: ' + (f.ai_bots || 0) +
+      (f.error ? ' · feed error: ' + f.error : '');
     const banner = $('#proxy-banner');
     const p = st.untrusted_proxy || {};
     if (p.count > 0 && !$('#trust-cloudflare').checked) {

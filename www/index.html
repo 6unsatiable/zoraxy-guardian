@@ -20,6 +20,7 @@
 <nav>
   <button class="tab active" data-tab="ip">IP rules</button>
   <button class="tab" data-tab="ua">User agents</button>
+  <button class="tab" data-tab="protection">Protection</button>
   <button class="tab" data-tab="waf">WAF rules</button>
   <button class="tab" data-tab="rate">Rate limit</button>
   <button class="tab" data-tab="honeypot">Honeypot</button>
@@ -98,6 +99,13 @@
     <label>Threshold (strikes) <input type="number" id="autoban-threshold" min="1" value="5"></label>
     <label>Window (seconds) <input type="number" id="autoban-window" min="1" value="60"></label>
     <label>Ban duration (seconds) <input type="number" id="autoban-ban-secs" min="60" value="600"></label>
+  </section>
+
+  <section id="tab-protection" class="tab-panel">
+    <h2>Protection</h2>
+    <p class="hint"><strong>waf_engine</strong>: OWASP Core Rule Set (paranoia 1-4; exclusions by host/path/rule ID). <strong>bot_protection</strong>: AI/SEO/headless crawlers, fake search engines, scripting libraries and fake browsers. <strong>challenge</strong>: a JavaScript proof-of-work on page loads for <em>hosts</em>; API paths (<em>exempt_paths</em>), apps (<em>app_user_agents</em>), credentialed and LAN requests are never challenged. <strong>threat_feeds</strong>: Spamhaus DROP / FireHOL level 1. <strong>behavior</strong>: temp-bans unverified clients that request more than <em>max_paths</em> distinct paths per window on challenge hosts.</p>
+    <div id="protection-status" class="hint"></div>
+    <textarea id="protection-json" rows="28" spellcheck="false" style="width:100%;font-family:monospace"></textarea>
   </section>
 
   <section id="tab-fingerprint" class="tab-panel">

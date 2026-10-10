@@ -53,6 +53,7 @@ func TestHoneypotDisabledNoOp(t *testing.T) {
 	cfg := s.Snapshot()
 	cfg.Honeypot.Enabled = false
 	cfg.Honeypot.Paths = []ScopedEntry{{Value: "/.env"}}
+	cfg.WAFEngine.Enabled = false // CRS blocks /.env on its own
 	if err := s.Update(cfg); err != nil {
 		t.Fatal(err)
 	}

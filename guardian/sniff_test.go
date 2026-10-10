@@ -106,7 +106,8 @@ func TestUARule(t *testing.T) {
 
 func TestUARulePathExceptionDoesNotMatchQuery(t *testing.T) {
 	s := newStore(t, Config{
-		UABlocklist: []ScopedEntry{{Value: `(?i)sqlmap`, ExceptPaths: []string{"/robots.txt"}}},
+		UABlocklist:     []ScopedEntry{{Value: `(?i)sqlmap`, ExceptPaths: []string{"/robots.txt"}}},
+		DefaultsVersion: currentDefaultsVersion, // CRS would block sqlmap itself
 	})
 	if d := s.Evaluate(req("x.test", "1.2.3.4", "sqlmap/1.0", "/admin?next=/robots.txt")); !d.Block || d.Reason != "ua-blocklist" {
 		t.Errorf("query string must not exempt a UA rule, got %+v", d)

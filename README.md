@@ -1,6 +1,6 @@
 # Guardian
 
-A [Zoraxy](https://github.com/tobychui/zoraxy) plugin that adds an L7 security layer to your reverse-proxy rules: IP allow/block lists, User-Agent blocklists, WAF-style payload pattern matching, and per-IP rate limiting — with per-host scopes so each rule can apply globally or only to specific vhosts.
+A [Zoraxy](https://github.com/tobychui/zoraxy) plugin that turns your reverse proxy into a WAF and bot blocker: the OWASP Core Rule Set, a JavaScript proof-of-work challenge for browser-facing sites, AI/SEO crawler, fake-browser and fake-search-engine blocking, threat-intelligence feeds, crawl-behaviour bans, IP/User-Agent lists and per-IP rate limiting — with per-host scopes so each rule can apply globally or only to specific vhosts.
 
 [![build-and-release](https://github.com/6unsatiable/zoraxy-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/6unsatiable/zoraxy-guardian/actions/workflows/release.yml)
 [![latest release](https://img.shields.io/github/v/release/6unsatiable/zoraxy-guardian?include_prereleases&label=rolling)](https://github.com/6unsatiable/zoraxy-guardian/releases/tag/latest)
@@ -25,6 +25,11 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 
 | | |
 |---|---|
+| **OWASP Core Rule Set** | CRS v4 via [Coraza](https://coraza.io): SQLi, XSS, LFI/RFI, RCE, PHP/Java/Node injection, protocol attacks, scanner detection — over the URI, arguments and headers. Paranoia level 1-4, anomaly threshold, and per-host/path rule exclusions for false positives. |
+| **Browser challenge** | On the hosts you list, a page load without a valid `guardian_pass` cookie gets a small JavaScript proof-of-work page (no external requests, no CAPTCHA). The cookie is HMAC-signed and bound to host and User-Agent. API paths (`/api/` by default), app User-Agents, requests with credentials, XHR/fetch, static assets and LAN clients are never challenged, so apps and webhooks keep working. |
+| **Bot protection** | Blocks AI crawlers (list refreshed daily from [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt)), SEO/marketing crawlers and headless browsers by User-Agent; blocks clients claiming to be Googlebot/Bingbot/etc. that fail forward-confirmed reverse DNS. On challenge hosts it also blocks scripting libraries (curl, python-requests, Go-http-client…) outside API paths, and "browsers" missing the headers every real browser sends. |
+| **Threat feeds** | Spamhaus DROP and FireHOL level 1, refreshed every 12 h and cached on disk. Entries covering private, reserved, Cloudflare, trusted-proxy or exempt ranges are dropped. |
+| **Crawl behaviour** | On challenge hosts, an unverified client requesting more than 40 distinct paths a minute is temp-banned. |
 | **IP rules** | Allowlist + blocklist. CIDR (IPv4 + IPv6) and single IPs. |
 | **User-Agent blocklist** | Go regex (use `(?i)` for case-insensitive). |
 | **WAF rules** | Go regex over URI, full URL, Cookie, Referer, checked both as sent and percent-decoded (twice, for double encoding). 10 consolidated default rules. |
@@ -41,7 +46,7 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 | **Cloudflare aware** | One switch trusts Cloudflare's built-in edge ranges and reads `CF-Connecting-IP` (only from real Cloudflare addresses). A proxy address is never banned, struck or rate limited, and the UI warns when traffic arrives through a proxy Guardian doesn't trust. |
 | **Persistent bans** | Temp and fingerprint bans are saved to `bans.json` and survive a restart. IPv6 clients are banned and rate limited per /64. |
 | **Dark mode** | Light / dark theme toggle, persisted in localStorage; defaults to system preference. |
-| **No external services** | Single ~6 MB Go binary. Embedded UI. No DB, no Redis. |
+| **No external services** | Single Go binary with the rule set and UI embedded. No DB, no Redis. Only outbound traffic: the threat-feed and AI-bot list downloads. |
 
 ---
 
@@ -187,18 +192,22 @@ Matching is case-insensitive; port suffixes (`:8443`) are stripped before matchi
 
 For each incoming request:
 
-1. **Temp ban** — IP currently in the auto-expiring ban list
-2. **IP blocklist** — static CIDR/IP block
-3. **Host blocklist** — regex on the `Host` header
-4. **Honeypot** — URI matches a tripwire path → installs a temp ban as a side-effect
-5. **IP allowlist** — only enforced on hosts where an allow rule applies
-6. **User-Agent blocklist** (with optional path exceptions)
-7. **WAF rules**
-8. **Rate limit**
+1. **Exempt CIDRs** — skip everything
+2. **Fingerprint / temp ban**
+3. **IP blocklist**, then **threat feeds**
+4. **Host blocklist** — regex on the `Host` header
+5. **Honeypot** — URI matches a tripwire path → installs a temp ban as a side-effect
+6. **IP allowlist** — only enforced on hosts where an allow rule applies
+7. **User-Agent blocklist** (with optional path exceptions)
+8. **Bot protection** — AI/SEO/headless crawlers, fake search engines
+9. **WAF rules**
+10. **OWASP Core Rule Set**
+11. **Challenge hosts** — proof-of-work for page loads; HTTP-library, fake-browser and crawl-behaviour checks for everything else
+12. **Rate limit**
 
-First match wins. The decision is recorded under the request's UUID; when Zoraxy follows up to deliver the actual request body to Guardian's capture endpoint, Guardian responds with `403` (or `429` for rate-limit) and an `X-Guardian-Reason` header.
+First match wins. The decision is recorded under the request's UUID; when Zoraxy follows up to deliver the actual request body to Guardian's capture endpoint, Guardian responds with `403` (or `429` for rate-limit, or the challenge page) and an `X-Guardian-Reason` header.
 
-Blocks from rules 2 and 5-8 also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
+Blocks from the IP and host blocklists, UA, bot, WAF, CRS and challenge-host checks also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
 
 ---
 

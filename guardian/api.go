@@ -45,6 +45,8 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"untrusted_proxy":    a.store.ProxyWarningSnapshot(),
 		"suppressed_repeats": a.store.SuppressedRepeats(),
 		"temp_bans":          len(a.store.TempBansSnapshot()),
+		"feeds":              a.store.FeedStatus(),
+		"waf_engine":         a.store.WAFEngineStatus(),
 	})
 }
 

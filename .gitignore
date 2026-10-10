@@ -20,3 +20,5 @@
 *.out
 *.test
 dist/
+/challenge.key
+/feed-*.txt

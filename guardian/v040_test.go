@@ -160,7 +160,7 @@ func TestExemptClientsAreNeverBlocked(t *testing.T) {
 
 func TestRateLimitResponseHasRetryAfter(t *testing.T) {
 	rec := httptest.NewRecorder()
-	WriteBlockResponse(rec, Decision{Block: true, Reason: "rate-limit", Status: http.StatusTooManyRequests})
+	WriteBlockResponse(rec, nil, Decision{Block: true, Reason: "rate-limit", Status: http.StatusTooManyRequests})
 	if rec.Code != 429 || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("got %d, Retry-After=%q", rec.Code, rec.Header().Get("Retry-After"))
 	}

@@ -16,13 +16,17 @@ import (
 //
 //  1. Fingerprint ban (cross-IP tracking of malicious signatures)
 //  2. Temp ban (set by honeypot or auto-ban escalation)
-//  3. IP blocklist
+//  3. IP blocklist, then threat feeds
 //  4. Host-header blocklist
 //  5. Honeypot path match (installs a temp ban as a side-effect)
 //  6. IP allowlist (only enforced on hosts where an allow rule applies)
 //  7. UA blocklist (with optional ExceptPaths)
-//  8. WAF rules
-//  9. Rate limit
+//  8. Bot protection (AI/SEO/headless crawlers, fake search engines)
+//  9. WAF rules
+//  10. OWASP Core Rule Set (Coraza)
+//  11. Challenge hosts: JS proof-of-work for page loads; HTTP-library,
+//     fake-browser and crawl-behaviour checks for everything else
+//  12. Rate limit
 //
 // After any block (other than temp-ban itself, which is already promoted),
 // the IP gets a strike towards auto-ban escalation, and if fingerprint
@@ -48,6 +52,14 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	wafNames := s.wafRuleNames
 	honeypotRules := s.honeypotRules
 	limiter := s.limiter
+	crs := s.crs
+	bots := s.cfg.BotProtection
+	chal := s.cfg.Challenge
+	chal.Hosts = s.challengeHosts
+	chalExempt := s.challengeExempt
+	appUARules := s.appUARules
+	behavior := s.cfg.Behavior
+	feedsOn := s.cfg.ThreatFeeds.Enabled
 	s.mu.RUnlock()
 
 	ip := clientIP(req, trustedProxies)
@@ -108,6 +120,12 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 				return block("ip-blocklist", http.StatusForbidden)
 			}
 		}
+	}
+
+	// 3b. Threat feeds (hijacked/criminal networks). No strike: the
+	// address is blocked on every request anyway.
+	if feedsOn && parsedIP != nil && !viaProxy && s.feeds.ips.Load().contains(parsedIP) {
+		return block("threat-feed", http.StatusForbidden)
 	}
 
 	// 4. Host-header blocklist
@@ -178,13 +196,99 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 
-	// 8. WAF rules
+	// 8. Bot protection (User-Agent classes, fake search engines)
+	lua := strings.ToLower(ua)
+	verifiedEngine := false
+	if bots.Enabled {
+		if bots.BlockAIScrapers {
+			if t := matchAny(lua, *s.feeds.aiBots.Load()); t != "" {
+				return block("ai-scraper", http.StatusForbidden)
+			}
+		}
+		if bots.BlockSEOCrawlers && matchAny(lua, seoBots) != "" {
+			return block("seo-crawler", http.StatusForbidden)
+		}
+		if bots.BlockHeadless && matchAny(lua, headlessMarkers) != "" {
+			return block("headless-browser", http.StatusForbidden)
+		}
+		if eng := claimedSearchEngine(lua); eng != nil && parsedIP != nil && !viaProxy {
+			if bots.VerifySearchEngines && !s.bots.verify(eng, ip) {
+				strike(false)
+				return block("fake-search-engine", http.StatusForbidden)
+			}
+			if bots.BlockSearchEngines {
+				return block("search-engine", http.StatusForbidden)
+			}
+			verifiedEngine = true
+		}
+	}
+
+	// 9. WAF rules
 	if hit := wafCheck(req, host, wafRules, wafNames); hit != "" {
 		strike(true)
 		return block("waf-"+hit, http.StatusForbidden)
 	}
 
-	// 9. Rate limit
+	// 10. OWASP Core Rule Set
+	if crs != nil {
+		if reason := crsCheck(crs, req, ip); reason != "" {
+			strike(true)
+			return block(reason, http.StatusForbidden)
+		}
+	}
+
+	// 11. Browser-facing hosts: challenge page loads, check everything else
+	// without user interaction.
+	if chal.Enabled && HostMatches(host, chal.Hosts) && len(chal.Hosts) > 0 && !verifiedEngine {
+		private := parsedIP == nil || parsedIP.IsPrivate() || parsedIP.IsLoopback() || parsedIP.IsLinkLocalUnicast()
+		path := requestPath(req.RequestURI)
+		hostKey := strings.ToLower(hostOnly(host))
+		if path == verifyPath {
+			return s.verifyDecision(rawQuery(req.RequestURI), ip, key, ua, hostKey, chal.Difficulty, chal.CookieHours)
+		}
+		hasAuth := false
+		for _, h := range authHeaders {
+			if firstHeader(req.Header, h) != "" {
+				hasAuth = true
+				break
+			}
+		}
+		appUA := false
+		for _, r := range appUARules {
+			if HostMatches(host, r.Hosts) && r.RE.MatchString(ua) {
+				appUA = true
+				break
+			}
+		}
+		exempt := false
+		for _, r := range chalExempt {
+			if HostMatches(host, r.Hosts) && r.RE.MatchString(path) {
+				exempt = true
+				break
+			}
+		}
+		if !private && !hasAuth && !appUA && !s.validCookie(req.Header, hostKey, ua, time.Now()) {
+			isBrowser := looksLikeBrowser(lua)
+			if !exempt && !hasStaticExt(path) && (req.Method == http.MethodGet || req.Method == http.MethodHead) && isNavigation(req.Header, isBrowser) {
+				return s.challengeDecision(ip, key, ua, hostKey, safeReturnPath(req.RequestURI), chal.Difficulty)
+			}
+			if bots.Enabled && bots.BlockHTTPLibraries && !exempt && (ua == "" || matchAny(lua, httpLibraries) != "") {
+				return block("http-library", http.StatusForbidden)
+			}
+			if bots.Enabled && bots.BlockFakeBrowsers && isBrowser &&
+				firstHeader(req.Header, "Accept-Language") == "" && firstHeader(req.Header, "Sec-Fetch-Mode") == "" &&
+				firstHeader(req.Header, "Sec-Fetch-Site") == "" {
+				return block("fake-browser", http.StatusForbidden)
+			}
+			if behavior.Enabled && !viaProxy &&
+				s.behavior.note(key, path, behavior.MaxPaths, time.Duration(behavior.WindowSeconds)*time.Second, time.Now()) {
+				s.AddTempBan(key, time.Duration(behavior.BanSeconds)*time.Second)
+				return block("scraping-behavior", http.StatusForbidden)
+			}
+		}
+	}
+
+	// 12. Rate limit
 	if limiter != nil && parsedIP != nil && !viaProxy {
 		if !limiter.allow(key) {
 			strike(false)
@@ -307,3 +411,33 @@ func firstHeader(h map[string][]string, name string) string {
 	}
 	return ""
 }
+
+// isNavigation reports whether a request is a top-level page load, the only
+// kind that can be answered with a challenge page.
+func isNavigation(h map[string][]string, browserUA bool) bool {
+	if mode := firstHeader(h, "Sec-Fetch-Mode"); mode != "" {
+		return mode == "navigate"
+	}
+	return browserUA || strings.Contains(strings.ToLower(firstHeader(h, "Accept")), "text/html")
+}
+
+func hasStaticExt(path string) bool {
+	p := strings.ToLower(path)
+	for _, e := range staticExtensions {
+		if strings.HasSuffix(p, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func rawQuery(requestURI string) string {
+	if _, q, ok := strings.Cut(requestURI, "?"); ok {
+		return q
+	}
+	return ""
+}
+
+// authHeaders mark API clients carrying their own credentials; they are never
+// challenged.
+var authHeaders = []string{"Authorization", "X-Api-Key", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", "X-Plex-Token"}
