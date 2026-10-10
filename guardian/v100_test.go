@@ -119,7 +119,7 @@ func TestChallengeRoundTrip(t *testing.T) {
 	v := req("web.test", ip, "", verifyPath+"?c="+url.QueryEscape(c)+"&n="+strconv.Itoa(nonce)+"&r="+m[3])
 	v.Header = browserReq("", "", "")
 	d = s.Evaluate(v)
-	if d.Kind != KindRedirect || d.Headers["Location"] != "/dashboard?x=1" {
+	if d.Kind != KindRedirect || d.Headers["Location"] != "https://web.test/dashboard?x=1" {
 		t.Fatalf("verify: %s %v", d.Reason, d.Headers)
 	}
 	cookie := strings.SplitN(d.Headers["Set-Cookie"], ";", 2)[0]

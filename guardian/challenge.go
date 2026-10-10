@@ -210,7 +210,9 @@ func (s *Store) verifyDecision(rawQuery, ip, ipKey, ua, host string, difficulty,
 		Status: http.StatusFound,
 		IP:     ip,
 		Headers: map[string]string{
-			"Location":   ret,
+			// Absolute: Zoraxy rewrites a relative Location against the
+			// plugin's capture path. host is always a listed challenge host.
+			"Location":   "https://" + host + ret,
 			"Set-Cookie": fmt.Sprintf("%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Lax", challengeCookie, val, int(ttl.Seconds())),
 		},
 	}
