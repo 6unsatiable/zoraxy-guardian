@@ -257,6 +257,9 @@ const (
 	KindRedirect  = "redirect"
 )
 
+// runFeedLoop is turned off by tests so they never download feeds.
+var runFeedLoop = true
+
 func LoadState(configPath, logPath string) (*Store, error) {
 	s := &Store{
 		configPath:         configPath,
@@ -297,7 +300,9 @@ func LoadState(configPath, logPath string) (*Store, error) {
 	s.log = log
 	s.loadBans()
 	go s.banSweepLoop()
-	go s.feedLoop()
+	if runFeedLoop {
+		go s.feedLoop()
+	}
 	return s, nil
 }
 
