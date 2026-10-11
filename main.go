@@ -34,7 +34,7 @@ func main() {
 		Type:          plugin.PluginType_Router,
 		VersionMajor:  1,
 		VersionMinor:  1,
-		VersionPatch:  0,
+		VersionPatch:  1,
 
 		DynamicCaptureSniff:   DynamicSniffIngress,
 		DynamicCaptureIngress: DynamicCaptureIngress,
