@@ -229,14 +229,29 @@ func (f *feedManager) cachePath(u string) string {
 
 // fetch returns the URL's content, from the disk cache when it is fresh
 // (or when the download fails).
-func (f *feedManager) fetch(ctx context.Context, u string, maxAge time.Duration) ([]byte, error) {
+//
+// count measures a payload (entries parsed). A download that parses to
+// nothing, or to less than half of the cached copy, is rejected and the
+// cached copy kept, so an HTML error page or truncated file can't wipe a
+// good list.
+func (f *feedManager) fetch(ctx context.Context, u string, maxAge time.Duration, count func([]byte) int) ([]byte, error) {
 	p := f.cachePath(u)
 	if st, err := os.Stat(p); err == nil && time.Since(st.ModTime()) < maxAge {
 		return os.ReadFile(p)
 	}
+	cached, cerr := os.ReadFile(p)
 	data, err := f.download(ctx, u)
+	if err == nil {
+		n := count(data)
+		switch {
+		case n == 0:
+			err = &feedError{u, "download contained no usable entries"}
+		case cerr == nil && n*2 < count(cached):
+			err = &feedError{u, "download shrank by more than half"}
+		}
+	}
 	if err != nil {
-		if cached, cerr := os.ReadFile(p); cerr == nil {
+		if cerr == nil {
 			return cached, err
 		}
 		return nil, err
@@ -276,7 +291,7 @@ func (f *feedManager) refresh(cfg ThreatFeeds, never []*net.IPNet) {
 	if cfg.Enabled {
 		var nets []*net.IPNet
 		for _, u := range cfg.URLs {
-			data, err := f.fetch(ctx, u, maxAge)
+			data, err := f.fetch(ctx, u, maxAge, func(b []byte) int { return len(parseFeed(b)) })
 			if err != nil {
 				errs = append(errs, err.Error())
 			}
@@ -286,7 +301,7 @@ func (f *feedManager) refresh(cfg ThreatFeeds, never []*net.IPNet) {
 	} else {
 		f.ips.Store(nil)
 	}
-	if data, err := f.fetch(ctx, aiBotsURL, 24*time.Hour); len(data) > 0 {
+	if data, err := f.fetch(ctx, aiBotsURL, 24*time.Hour, func(b []byte) int { return len(parseAIBots(b)) }); len(data) > 0 {
 		if extra := parseAIBots(data); len(extra) > 0 {
 			seen := map[string]bool{}
 			var list []string

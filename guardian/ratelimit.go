@@ -1,6 +1,7 @@
 package guardian
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -113,16 +114,8 @@ func (rl *rateLimiter) evictOldestLocked(now time.Time) {
 	for k, b := range rl.buckets {
 		candidates = append(candidates, pair{k, now.Sub(b.last)})
 	}
-	// Partial sort would be cheaper, but maxBuckets only triggers on
-	// extreme load. Full sort is fine for this corner.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].age > candidates[j].age })
 	for i := 0; i < target && i < len(candidates); i++ {
-		maxIdx := i
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].age > candidates[maxIdx].age {
-				maxIdx = j
-			}
-		}
-		candidates[i], candidates[maxIdx] = candidates[maxIdx], candidates[i]
 		delete(rl.buckets, candidates[i].k)
 	}
 }

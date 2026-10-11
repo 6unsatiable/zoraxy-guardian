@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/bits"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +30,11 @@ type Challenge struct {
 	Difficulty int `json:"difficulty"`
 	// CookieHours is how long a solved challenge stays valid.
 	CookieHours int `json:"cookie_hours"`
+	// BindCookieToNetwork ties the cookie to the client's /24 (IPv4) or /48
+	// (IPv6), so a stolen cookie is useless from another network. Off by
+	// default: phones that hop between mobile and Wi-Fi would be challenged
+	// again.
+	BindCookieToNetwork bool `json:"bind_cookie_to_network"`
 	// ExemptPaths are path prefixes that are never challenged (APIs,
 	// webhooks, manifests). Host-scoped via Hosts.
 	ExemptPaths []ScopedEntry `json:"exempt_paths"`
@@ -105,7 +111,55 @@ func (s *Store) checkChallenge(c, nonce, ipKey, ua, host string, difficulty int,
 		return false
 	}
 	sum := sha256.Sum256([]byte(c + nonce))
-	return leadingZeroBits(sum[:]) >= difficulty
+	if leadingZeroBits(sum[:]) < difficulty {
+		return false
+	}
+	// One solved challenge earns one cookie: without this, a single solve
+	// could be replayed for the whole 5 minutes to mint unlimited cookies.
+	return s.consumeChallenge(p[0]+"."+p[1], now)
+}
+
+// consumeChallenge records a challenge as used and reports whether this was
+// its first use.
+func (s *Store) consumeChallenge(id string, now time.Time) bool {
+	s.usedMu.Lock()
+	defer s.usedMu.Unlock()
+	if s.usedChallenges == nil {
+		s.usedChallenges = make(map[string]time.Time)
+	}
+	if _, used := s.usedChallenges[id]; used {
+		return false
+	}
+	if len(s.usedChallenges) >= maxTrackedKeys {
+		for k, exp := range s.usedChallenges {
+			if now.After(exp) {
+				delete(s.usedChallenges, k)
+			}
+		}
+		if len(s.usedChallenges) >= maxTrackedKeys {
+			// Refuse rather than forget: an attacker flooding solves must
+			// not be able to flush the replay record.
+			return false
+		}
+	}
+	s.usedChallenges[id] = now.Add(challengeTTL + 2*time.Minute)
+	return true
+}
+
+// networkKey is the client network a cookie is bound to ("" when binding is
+// off or the address is unusable).
+func networkKey(ip string, bind bool) string {
+	if !bind {
+		return ""
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ""
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return v4.Mask(net.CIDRMask(24, 32)).String()
+	}
+	return parsed.Mask(net.CIDRMask(48, 128)).String()
 }
 
 func leadingZeroBits(b []byte) int {
@@ -120,12 +174,12 @@ func leadingZeroBits(b []byte) int {
 	return n
 }
 
-func (s *Store) cookieValue(host, ua string, exp time.Time) string {
+func (s *Store) cookieValue(host, ua, netKey string, exp time.Time) string {
 	e := strconv.FormatInt(exp.Unix(), 10)
-	return e + "." + s.mac("k", host, e, uaHash(ua))[:32]
+	return e + "." + s.mac("k", host, e, uaHash(ua), netKey)[:32]
 }
 
-func (s *Store) validCookie(header map[string][]string, host, ua string, now time.Time) bool {
+func (s *Store) validCookie(header map[string][]string, host, ua, netKey string, now time.Time) bool {
 	for _, line := range headerValues(header, "Cookie") {
 		for _, part := range strings.Split(line, ";") {
 			k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
@@ -140,7 +194,7 @@ func (s *Store) validCookie(header map[string][]string, host, ua string, now tim
 			if err != nil || now.Unix() > exp {
 				continue
 			}
-			want := s.mac("k", host, e, uaHash(ua))[:32]
+			want := s.mac("k", host, e, uaHash(ua), netKey)[:32]
 			if hmac.Equal([]byte(want), []byte(sig)) {
 				return true
 			}
@@ -193,7 +247,7 @@ func (s *Store) challengeDecision(ip, ipKey, ua, host, returnTo string, difficul
 
 // verifyDecision handles /.guardian/verify: a correct solution earns the
 // cookie and a redirect back; anything else gets a fresh challenge.
-func (s *Store) verifyDecision(rawQuery, ip, ipKey, ua, host string, difficulty, cookieHours int) Decision {
+func (s *Store) verifyDecision(rawQuery, ip, ipKey, ua, host string, difficulty, cookieHours int, bind bool) Decision {
 	q, _ := url.ParseQuery(rawQuery)
 	ret := safeReturnPath(q.Get("r"))
 	if !s.checkChallenge(q.Get("c"), q.Get("n"), ipKey, ua, host, difficulty, time.Now()) {
@@ -202,7 +256,7 @@ func (s *Store) verifyDecision(rawQuery, ip, ipKey, ua, host string, difficulty,
 		return d
 	}
 	ttl := time.Duration(cookieHours) * time.Hour
-	val := s.cookieValue(host, ua, time.Now().Add(ttl))
+	val := s.cookieValue(host, ua, networkKey(ip, bind), time.Now().Add(ttl))
 	return Decision{
 		Block:  true,
 		Kind:   KindRedirect,

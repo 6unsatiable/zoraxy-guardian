@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +61,8 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	appUARules := s.appUARules
 	behavior := s.cfg.Behavior
 	feedsOn := s.cfg.ThreatFeeds.Enabled
+	maxBody := s.cfg.MaxBodyBytes
+	maxBodyHosts := s.cfg.MaxBodyHosts
 	s.mu.RUnlock()
 
 	ip := clientIP(req, trustedProxies)
@@ -139,6 +142,14 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 
+	// 4b. Declared body size (Zoraxy never shows plugins the body itself).
+	if maxBody > 0 && HostMatches(host, maxBodyHosts) {
+		if n, err := strconv.ParseInt(strings.TrimSpace(firstHeader(req.Header, "Content-Length")), 10, 64); err == nil && n > maxBody {
+			strike(false)
+			return block("body-too-large", http.StatusRequestEntityTooLarge)
+		}
+	}
+
 	// 5. Honeypot path match — install temp ban as a side-effect
 	if honeypotEnabled {
 		path := requestPath(req.RequestURI)
@@ -159,26 +170,20 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	}
 
 	// 6. Allowlist (only enforced if at least one allow rule applies to this host)
-	allowHostScoped := make([]compiledIPRule, 0, len(allowRules))
+	scoped, allowed := false, false
 	for _, r := range allowRules {
-		if HostMatches(host, r.Hosts) {
-			allowHostScoped = append(allowHostScoped, r)
+		if !HostMatches(host, r.Hosts) {
+			continue
+		}
+		scoped = true
+		if parsedIP != nil && r.Net.Contains(parsedIP) {
+			allowed = true
+			break
 		}
 	}
-	if len(allowHostScoped) > 0 {
-		allowed := false
-		if parsedIP != nil {
-			for _, r := range allowHostScoped {
-				if r.Net.Contains(parsedIP) {
-					allowed = true
-					break
-				}
-			}
-		}
-		if !allowed {
-			strike(false)
-			return block("not-allowlisted", http.StatusForbidden)
-		}
+	if scoped && !allowed {
+		strike(false)
+		return block("not-allowlisted", http.StatusForbidden)
 	}
 
 	// 7. UA blocklist (with ExceptPaths)
@@ -202,13 +207,16 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	if bots.Enabled {
 		if bots.BlockAIScrapers {
 			if t := matchAny(lua, *s.feeds.aiBots.Load()); t != "" {
+				strike(false)
 				return block("ai-scraper", http.StatusForbidden)
 			}
 		}
 		if bots.BlockSEOCrawlers && matchAny(lua, seoBots) != "" {
+			strike(false)
 			return block("seo-crawler", http.StatusForbidden)
 		}
 		if bots.BlockHeadless && matchAny(lua, headlessMarkers) != "" {
+			strike(false)
 			return block("headless-browser", http.StatusForbidden)
 		}
 		if eng := claimedSearchEngine(lua); eng != nil && parsedIP != nil && !viaProxy {
@@ -244,7 +252,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		path := requestPath(req.RequestURI)
 		hostKey := strings.ToLower(hostOnly(host))
 		if path == verifyPath {
-			return s.verifyDecision(rawQuery(req.RequestURI), ip, key, ua, hostKey, chal.Difficulty, chal.CookieHours)
+			return s.verifyDecision(rawQuery(req.RequestURI), ip, key, ua, hostKey, chal.Difficulty, chal.CookieHours, chal.BindCookieToNetwork)
 		}
 		hasAuth := false
 		for _, h := range authHeaders {
@@ -267,17 +275,19 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 				break
 			}
 		}
-		if !private && !hasAuth && !appUA && !s.validCookie(req.Header, hostKey, ua, time.Now()) {
+		if !private && !hasAuth && !appUA && !s.validCookie(req.Header, hostKey, ua, networkKey(ip, chal.BindCookieToNetwork), time.Now()) {
 			isBrowser := looksLikeBrowser(lua)
 			if !exempt && !hasStaticExt(path) && (req.Method == http.MethodGet || req.Method == http.MethodHead) && isNavigation(req.Header, isBrowser) {
 				return s.challengeDecision(ip, key, ua, hostKey, safeReturnPath(req.RequestURI), chal.Difficulty)
 			}
 			if bots.Enabled && bots.BlockHTTPLibraries && !exempt && (ua == "" || matchAny(lua, httpLibraries) != "") {
+				strike(false)
 				return block("http-library", http.StatusForbidden)
 			}
 			if bots.Enabled && bots.BlockFakeBrowsers && isBrowser &&
 				firstHeader(req.Header, "Accept-Language") == "" && firstHeader(req.Header, "Sec-Fetch-Mode") == "" &&
 				firstHeader(req.Header, "Sec-Fetch-Site") == "" {
+				strike(false)
 				return block("fake-browser", http.StatusForbidden)
 			}
 			if behavior.Enabled && !viaProxy &&
@@ -333,10 +343,14 @@ func requestPath(requestURI string) string {
 
 func wafCheck(req *plugin.DynamicSniffForwardRequest, host string, rules []compiledRegexRule, names []string) string {
 	target := req.RequestURI + " " + req.URL
+	// Every header is attack surface (User-Agent and X-Forwarded-* carry
+	// Log4Shell and SQLi payloads), except credentials, which legitimately
+	// hold arbitrary tokens.
 	for k, vs := range req.Header {
-		if strings.EqualFold(k, "cookie") || strings.EqualFold(k, "referer") {
-			target += " " + strings.Join(vs, " ")
+		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "proxy-authorization") {
+			continue
 		}
+		target += " " + strings.Join(vs, " ")
 	}
 	// Attackers percent-encode payloads (%3Cscript, ..%2f, double-encoded
 	// %252e) to get past literal patterns, so rules also see the decoded form.

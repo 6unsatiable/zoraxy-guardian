@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,19 +20,42 @@ type API struct {
 
 func NewAPI(s *Store) *API { return &API{store: s} }
 
+// guard rejects state-changing requests a browser sent on behalf of another
+// site. Zoraxy's CSRF token covers the normal path; this is a second layer
+// that doesn't depend on it. Browsers set Sec-Fetch-Site themselves and a page
+// can't forge it, and a JSON Content-Type can't be sent cross-site without a
+// CORS preflight, which this API never answers.
+func guard(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				http.Error(w, "cross-site request refused", http.StatusForbidden)
+				return
+			}
+			if r.ContentLength != 0 && r.Body != http.NoBody {
+				if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
+					http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+					return
+				}
+			}
+		}
+		h(w, r)
+	}
+}
+
 func (a *API) RegisterRoutes(ui *plugin.PluginUiRouter, mux *http.ServeMux) {
-	ui.HandleFunc("/api/config", a.handleConfig, mux)
-	ui.HandleFunc("/api/blocklog", a.handleBlockLog, mux)
-	ui.HandleFunc("/api/blocklog/export", a.handleBlockLogExport, mux)
-	ui.HandleFunc("/api/blocklog/summary", a.handleBlockLogSummary, mux)
-	ui.HandleFunc("/api/blocklog/stream", a.handleBlockLogStream, mux)
-	ui.HandleFunc("/api/tempbans", a.handleTempBans, mux)
-	ui.HandleFunc("/api/tempbans/clear", a.handleTempBansClear, mux)
-	ui.HandleFunc("/api/fingerprintbans", a.handleFingerprintBans, mux)
-	ui.HandleFunc("/api/fingerprintbans/clear", a.handleFingerprintBansClear, mux)
-	ui.HandleFunc("/api/import/cf", a.handleImportCF, mux)
-	ui.HandleFunc("/api/rules/recommended", a.handleRecommendedRules, mux)
-	ui.HandleFunc("/api/status", a.handleStatus, mux)
+	ui.HandleFunc("/api/config", guard(a.handleConfig), mux)
+	ui.HandleFunc("/api/blocklog", guard(a.handleBlockLog), mux)
+	ui.HandleFunc("/api/blocklog/export", guard(a.handleBlockLogExport), mux)
+	ui.HandleFunc("/api/blocklog/summary", guard(a.handleBlockLogSummary), mux)
+	ui.HandleFunc("/api/blocklog/stream", guard(a.handleBlockLogStream), mux)
+	ui.HandleFunc("/api/tempbans", guard(a.handleTempBans), mux)
+	ui.HandleFunc("/api/tempbans/clear", guard(a.handleTempBansClear), mux)
+	ui.HandleFunc("/api/fingerprintbans", guard(a.handleFingerprintBans), mux)
+	ui.HandleFunc("/api/fingerprintbans/clear", guard(a.handleFingerprintBansClear), mux)
+	ui.HandleFunc("/api/import/cf", guard(a.handleImportCF), mux)
+	ui.HandleFunc("/api/rules/recommended", guard(a.handleRecommendedRules), mux)
+	ui.HandleFunc("/api/status", guard(a.handleStatus), mux)
 }
 
 // handleStatus reports health signals the UI shows as banners: traffic that
@@ -53,6 +77,10 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 // writeUpdateError maps a Store.Update failure to 400 (bad config, the
 // message says what to fix) or 500 (could not be saved).
 func writeUpdateError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrConfigChanged) {
+		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
 	var verr *ValidationError
 	if errors.As(err, &verr) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -123,6 +151,7 @@ func (a *API) handleBlockLogExport(w http.ResponseWriter, r *http.Request) {
 func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		w.Header().Set("ETag", a.store.ConfigETag())
 		writeJSON(w, http.StatusOK, a.store.Snapshot())
 	case http.MethodPost:
 		var cfg Config
@@ -132,10 +161,11 @@ func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := a.store.Update(cfg); err != nil {
+		if err := a.store.UpdateIfMatch(cfg, r.Header.Get("If-Match")); err != nil {
 			writeUpdateError(w, err)
 			return
 		}
+		w.Header().Set("ETag", a.store.ConfigETag())
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -300,9 +330,8 @@ func (a *API) handleImportCF(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	cfg := a.store.Snapshot()
-	stats := MergeCFResult(&cfg, parsed)
-	if err := a.store.Update(cfg); err != nil {
+	var stats MergeStats
+	if err := a.store.Modify(func(cfg *Config) { stats = MergeCFResult(cfg, parsed) }); err != nil {
 		writeUpdateError(w, err)
 		return
 	}
@@ -328,13 +357,13 @@ func (a *API) handleRecommendedRules(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	cfg := a.store.Snapshot()
-	stats := MergeRecommendedRules(&cfg)
 	if !body.Apply {
-		writeJSON(w, http.StatusOK, map[string]any{"preview": stats})
+		cfg := a.store.Snapshot()
+		writeJSON(w, http.StatusOK, map[string]any{"preview": MergeRecommendedRules(&cfg)})
 		return
 	}
-	if err := a.store.Update(cfg); err != nil {
+	var stats RuleUpdateStats
+	if err := a.store.Modify(func(cfg *Config) { stats = MergeRecommendedRules(cfg) }); err != nil {
 		writeUpdateError(w, err)
 		return
 	}

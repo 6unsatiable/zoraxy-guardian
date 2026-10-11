@@ -17,9 +17,10 @@ type Behavior struct {
 	BanSeconds    int  `json:"ban_seconds"`
 }
 
+// pathWindow remembers when each distinct path was last requested, so the
+// window rolls: a path counts until `window` after its latest hit.
 type pathWindow struct {
-	start time.Time
-	paths map[uint64]struct{}
+	seen map[uint64]time.Time
 }
 
 type behaviorTracker struct {
@@ -32,7 +33,7 @@ func newBehaviorTracker() *behaviorTracker {
 }
 
 // note records a request path for key and reports whether the key has now
-// requested more than max distinct paths within window.
+// requested more than max distinct paths within the rolling window.
 func (t *behaviorTracker) note(key, path string, max int, window time.Duration, now time.Time) bool {
 	h := fnv.New64a()
 	h.Write([]byte(path))
@@ -40,24 +41,51 @@ func (t *behaviorTracker) note(key, path string, max int, window time.Duration, 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	w := t.keys[key]
-	if w == nil || now.Sub(w.start) > window {
-		if w == nil && len(t.keys) >= maxTrackedKeys {
-			for k, v := range t.keys {
-				if now.Sub(v.start) > window {
-					delete(t.keys, k)
-				}
-			}
-			if len(t.keys) >= maxTrackedKeys {
-				return false
-			}
+	if w == nil {
+		if len(t.keys) >= maxTrackedKeys {
+			t.evict(now, window)
 		}
-		w = &pathWindow{start: now, paths: make(map[uint64]struct{})}
+		w = &pathWindow{seen: make(map[uint64]time.Time)}
 		t.keys[key] = w
 	}
-	w.paths[sum] = struct{}{}
-	if len(w.paths) > max {
+	w.seen[sum] = now
+	live := 0
+	for k, at := range w.seen {
+		if now.Sub(at) > window {
+			delete(w.seen, k)
+			continue
+		}
+		live++
+	}
+	if live > max {
 		delete(t.keys, key)
 		return true
 	}
 	return false
+}
+
+// evict makes room for a new key: idle ones first, then a tenth of the rest.
+// Dropping tracked keys is preferred over refusing to track new ones, which
+// would let a flood of throwaway addresses blind the tracker.
+func (t *behaviorTracker) evict(now time.Time, window time.Duration) {
+	for k, v := range t.keys {
+		idle := true
+		for _, at := range v.seen {
+			if now.Sub(at) <= window {
+				idle = false
+				break
+			}
+		}
+		if idle {
+			delete(t.keys, k)
+		}
+	}
+	drop := len(t.keys) - maxTrackedKeys + maxTrackedKeys/10
+	for k := range t.keys {
+		if drop <= 0 {
+			break
+		}
+		delete(t.keys, k)
+		drop--
+	}
 }

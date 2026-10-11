@@ -26,13 +26,14 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 | | |
 |---|---|
 | **OWASP Core Rule Set** | CRS v4 via [Coraza](https://coraza.io): SQLi, XSS, LFI/RFI, RCE, PHP/Java/Node injection, protocol attacks, scanner detection — over the URI, arguments and headers. Paranoia level 1-4, anomaly threshold, and per-host/path rule exclusions for false positives. |
-| **Browser challenge** | On the hosts you list, a page load without a valid `guardian_pass` cookie gets a small JavaScript proof-of-work page (no external requests, no CAPTCHA). The cookie is HMAC-signed and bound to host and User-Agent. API paths (`/api/` by default), app User-Agents, requests with credentials, XHR/fetch, static assets and LAN clients are never challenged, so apps and webhooks keep working. |
+| **Browser challenge** | On the hosts you list, a page load without a valid `guardian_pass` cookie gets a small JavaScript proof-of-work page (no external requests, no CAPTCHA). The cookie is HMAC-signed and bound to host and User-Agent (optionally also to the client's /24 or /48 with `bind_cookie_to_network`), and each solved challenge is accepted once. API paths (`/api/` by default), app User-Agents, requests with credentials, XHR/fetch, static assets and LAN clients are never challenged, so apps and webhooks keep working. |
 | **Bot protection** | Blocks AI crawlers (list refreshed daily from [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt)), SEO/marketing crawlers and headless browsers by User-Agent; blocks clients claiming to be Googlebot/Bingbot/etc. that fail forward-confirmed reverse DNS. On challenge hosts it also blocks scripting libraries (curl, python-requests, Go-http-client…) outside API paths, and "browsers" missing the headers every real browser sends. |
 | **Threat feeds** | Spamhaus DROP and FireHOL level 1, refreshed every 12 h and cached on disk. Entries covering private, reserved, Cloudflare, trusted-proxy or exempt ranges are dropped. |
 | **Crawl behaviour** | On challenge hosts, an unverified client requesting more than 40 distinct paths a minute is temp-banned. |
 | **IP rules** | Allowlist + blocklist. CIDR (IPv4 + IPv6) and single IPs. |
 | **User-Agent blocklist** | Go regex (use `(?i)` for case-insensitive). |
-| **WAF rules** | Go regex over URI, full URL, Cookie, Referer, checked both as sent and percent-decoded (twice, for double encoding). 10 consolidated default rules. |
+| **WAF rules** | Go regex over URI, full URL and every request header except `Authorization`, checked both as sent and percent-decoded (twice, for double encoding). 10 consolidated default rules. |
+| **Body size cap** | `max_body_bytes` (optionally limited to `max_body_hosts`) rejects requests whose `Content-Length` is too large with HTTP 413. **Request bodies are not scanned**: Zoraxy's plugin API never sends them (only headers and URL), so no plugin can. Chunked uploads have no declared length and pass the cap. |
 | **Rate limit** | Per-IP token bucket with automatic idle bucket eviction. |
 | **Honeypot paths** | Any request to a tripwire URL (e.g. `/.env`, `/wp-login.php`) installs a temp ban on the source IP. |
 | **Host-header blocklist** | Block by regex against the request's `Host` header — useful for rejecting probes that arrive with `Host: localhost` etc. |
@@ -195,7 +196,7 @@ For each incoming request:
 1. **Exempt CIDRs** — skip everything
 2. **Fingerprint / temp ban**
 3. **IP blocklist**, then **threat feeds**
-4. **Host blocklist** — regex on the `Host` header
+4. **Host blocklist** — regex on the `Host` header, then the declared body-size cap
 5. **Honeypot** — URI matches a tripwire path → installs a temp ban as a side-effect
 6. **IP allowlist** — only enforced on hosts where an allow rule applies
 7. **User-Agent blocklist** (with optional path exceptions)
@@ -207,7 +208,7 @@ For each incoming request:
 
 First match wins. The decision is recorded under the request's UUID; when Zoraxy follows up to deliver the actual request body to Guardian's capture endpoint, Guardian responds with `403` (or `429` for rate-limit, or the challenge page) and an `X-Guardian-Reason` header.
 
-Blocks from the IP and host blocklists, UA, bot, WAF, CRS and challenge-host checks also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
+Blocks from the IP and host blocklists, UA, bot, body-size, WAF, CRS and challenge-host checks also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
 
 ---
 

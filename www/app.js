@@ -116,6 +116,8 @@
     $('#trust-cloudflare').checked = !!c.trust_cloudflare;
     $('#exempt-cidrs').value = hostsToStr(c.exempt_cidrs);
     $('#ignore-zoraxy-blacklist').checked = !!c.ignore_zoraxy_blacklist;
+    $('#max-body-bytes').value = c.max_body_bytes ?? 0;
+    $('#max-body-hosts').value = hostsToStr(c.max_body_hosts);
   }
 
   function collectUI() {
@@ -165,13 +167,20 @@
       trust_cloudflare: $('#trust-cloudflare').checked,
       exempt_cidrs: strToHosts($('#exempt-cidrs').value) || [],
       ignore_zoraxy_blacklist: $('#ignore-zoraxy-blacklist').checked,
+      max_body_bytes: parseInt($('#max-body-bytes').value, 10) || 0,
+      max_body_hosts: strToHosts($('#max-body-hosts').value) || [],
     };
   }
+
+  // ETag of the config the form was loaded from; sent back as If-Match so a
+  // stale tab can't overwrite changes made elsewhere.
+  let configETag = '';
 
   async function fetchConfig() {
     setStatus('Loading…');
     const r = await fetch('./api/config', { headers: { 'X-CSRF-Token': csrfToken } });
     if (!r.ok) { setStatus('Load failed', true); return; }
+    configETag = r.headers.get('ETag') || '';
     applyToUI(await r.json());
     setStatus('Loaded');
   }
@@ -182,9 +191,13 @@
     setStatus('Saving…');
     const r = await fetch('./api/config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken, ...(configETag ? { 'If-Match': configETag } : {}) },
       body: JSON.stringify(body),
     });
+    if (r.status === 412) {
+      setStatus('Config changed elsewhere since you loaded it. Reload the page, then re-apply your edit.', true);
+      return;
+    }
     if (!r.ok) {
       // The server explains validation failures (e.g. which rule has a bad regex).
       const detail = (await r.text().catch(() => '')).trim();

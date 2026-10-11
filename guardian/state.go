@@ -1,7 +1,10 @@
 package guardian
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -50,6 +53,12 @@ type Config struct {
 	// IgnoreZoraxyBlacklist stops mirroring Zoraxy's own blacklist/geo hits
 	// into the block log (they can drown out Guardian's own blocks).
 	IgnoreZoraxyBlacklist bool `json:"ignore_zoraxy_blacklist"`
+	// MaxBodyBytes rejects requests whose Content-Length exceeds it (0 = off).
+	// Zoraxy never shows plugins request bodies, so the declared length is
+	// all Guardian can see. Chunked uploads carry no length and pass.
+	MaxBodyBytes int64 `json:"max_body_bytes"`
+	// MaxBodyHosts limits the cap to these hosts (empty = every host).
+	MaxBodyHosts []string `json:"max_body_hosts"`
 
 	WAFEngine     WAFEngine     `json:"waf_engine"`
 	BotProtection BotProtection `json:"bot_protection"`
@@ -183,10 +192,12 @@ type Store struct {
 	logThrottle   map[string]time.Time
 	suppressed    int64
 
-	secret   []byte
-	bots     *botVerifier
-	feeds    *feedManager
-	behavior *behaviorTracker
+	secret         []byte
+	usedMu         sync.Mutex
+	usedChallenges map[string]time.Time // solved challenge id -> forget-after
+	bots           *botVerifier
+	feeds          *feedManager
+	behavior       *behaviorTracker
 
 	// Temporary bans + strike tracking (separate mutex; hot path).
 	banMu              sync.Mutex
@@ -292,7 +303,7 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		// config files (Honeypot/AutoBan didn't exist before v0.3).
 		s.cfg = mergeDefaults(s.cfg)
 	}
-	s.compile()
+	s.compile(nil)
 	log, err := openBlockLog(logPath, maxBlockLog)
 	if err != nil {
 		return nil, err
@@ -438,6 +449,9 @@ func mergeDefaults(c Config) Config {
 	if c.ExemptCIDRs == nil {
 		c.ExemptCIDRs = []string{}
 	}
+	if c.MaxBodyHosts == nil {
+		c.MaxBodyHosts = []string{}
+	}
 	if c.TrustedProxyCIDRs == nil {
 		c.TrustedProxyCIDRs = []string{}
 	}
@@ -580,7 +594,15 @@ func mergeDefaults(c Config) Config {
 	return c
 }
 
-func (s *Store) compile() {
+// preparedCRS is a rule set loaded before the config lock is taken, because
+// loading takes a second or two and requests must not wait for it.
+type preparedCRS struct {
+	key string
+	waf coraza.WAF
+	err string
+}
+
+func (s *Store) compile(pre *preparedCRS) {
 	// Stop the old limiter goroutine before swapping in a new one.
 	if s.limiter != nil {
 		s.limiter.Stop()
@@ -629,18 +651,24 @@ func (s *Store) compile() {
 	if !s.cfg.WAFEngine.Enabled {
 		s.crs, s.crsCfg, s.crsErr = nil, "", ""
 	} else if string(crsKey) != s.crsCfg {
-		waf, err := newCRS(s.cfg.WAFEngine)
-		if err != nil {
-			s.crsErr = err.Error()
-			s.crs = nil
-		} else {
-			s.crs, s.crsErr = waf, ""
+		if pre == nil || pre.key != string(crsKey) {
+			pre = s.loadCRS(s.cfg.WAFEngine)
 		}
-		s.crsCfg = string(crsKey)
+		s.crs, s.crsErr, s.crsCfg = pre.waf, pre.err, pre.key
 	}
 	if s.feeds != nil {
 		s.feeds.trigger()
 	}
+}
+
+// loadCRS builds the Core Rule Set for cfg. It touches no Store state.
+func (s *Store) loadCRS(cfg WAFEngine) *preparedCRS {
+	key, _ := json.Marshal(cfg)
+	waf, err := newCRS(cfg)
+	if err != nil {
+		return &preparedCRS{key: string(key), err: err.Error()}
+	}
+	return &preparedCRS{key: string(key), waf: waf}
 }
 
 // compilePrefixRules matches request paths that start with the entry
@@ -781,7 +809,45 @@ func (s *Store) Snapshot() Config {
 	return cfg
 }
 
-func (s *Store) Update(cfg Config) error {
+// ErrConfigChanged means the config was modified since the caller read it.
+var ErrConfigChanged = errors.New("config changed since it was loaded; reload and try again")
+
+// ConfigETag identifies the current config contents.
+func (s *Store) ConfigETag() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return configETag(s.cfg)
+}
+
+func configETag(cfg Config) string {
+	b, _ := json.Marshal(cfg)
+	h := sha256.Sum256(b)
+	return `"` + hex.EncodeToString(h[:8]) + `"`
+}
+
+// Update replaces the whole config.
+func (s *Store) Update(cfg Config) error { return s.UpdateIfMatch(cfg, "") }
+
+// UpdateIfMatch is Update, but if ifMatch is not empty it must equal the
+// current ConfigETag, so two editors can't silently overwrite each other.
+func (s *Store) UpdateIfMatch(cfg Config, ifMatch string) error {
+	return s.modify(ifMatch, func(c *Config) { *c = cfg })
+}
+
+// Modify applies fn to a copy of the current config and saves the result,
+// atomically with respect to other updates.
+func (s *Store) Modify(fn func(*Config)) error {
+	return s.modify("", fn)
+}
+
+func (s *Store) modify(ifMatch string, fn func(*Config)) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	cfg := s.Snapshot()
+	if ifMatch != "" && ifMatch != configETag(cfg) {
+		return ErrConfigChanged
+	}
+	fn(&cfg)
 	cfg = mergeDefaults(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return &ValidationError{Err: err}
@@ -790,19 +856,27 @@ func (s *Store) Update(cfg Config) error {
 	if err != nil {
 		return err
 	}
-
-	// Persist before publishing the new configuration. This keeps the
-	// running policy and config.json consistent if the filesystem is full or
-	// otherwise unavailable.
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Slow work happens before s.mu is taken: loading the rule set and
+	// writing the file. Requests only wait for the final swap.
+	var pre *preparedCRS
+	if cfg.WAFEngine.Enabled {
+		key, _ := json.Marshal(cfg.WAFEngine)
+		s.mu.RLock()
+		same := string(key) == s.crsCfg
+		s.mu.RUnlock()
+		if !same {
+			pre = s.loadCRS(cfg.WAFEngine)
+		}
+	}
+	// Persist before publishing: the running policy and config.json stay
+	// consistent if the filesystem is full or unavailable.
 	if err := atomicWriteFile(s.configPath, data, 0o644); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.cfg = cfg
-	s.compile()
+	s.compile(pre)
 	return nil
 }
 
@@ -834,6 +908,9 @@ func validateConfig(cfg Config) error {
 		if _, err := regexp.Compile(r.Pattern); err != nil {
 			return fmt.Errorf("WAF rule %d: %w", i+1, err)
 		}
+	}
+	if cfg.MaxBodyBytes < 0 {
+		return fmt.Errorf("max body size cannot be negative")
 	}
 	if cfg.RateLimit.Enabled && (cfg.RateLimit.RequestsPerMinute < 1 || cfg.RateLimit.Burst < 1) {
 		return fmt.Errorf("rate limit requests per minute and burst must be positive")

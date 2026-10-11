@@ -110,9 +110,17 @@ func claimedSearchEngine(ua string) *searchEngine {
 type botVerifier struct {
 	mu    sync.Mutex
 	cache map[string]botVerdict
+	// inflight holds the lookup currently running for a key, so a burst of
+	// requests from one address shares a single DNS round trip.
+	inflight map[string]*botCall
 	// lookups are overridable in tests.
 	lookupAddr func(ctx context.Context, addr string) ([]string, error)
 	lookupIP   func(ctx context.Context, host string) ([]net.IPAddr, error)
+}
+
+type botCall struct {
+	done chan struct{}
+	ok   bool
 }
 
 type botVerdict struct {
@@ -123,6 +131,7 @@ type botVerdict struct {
 func newBotVerifier() *botVerifier {
 	return &botVerifier{
 		cache:      make(map[string]botVerdict),
+		inflight:   make(map[string]*botCall),
 		lookupAddr: net.DefaultResolver.LookupAddr,
 		lookupIP:   net.DefaultResolver.LookupIPAddr,
 	}
@@ -139,6 +148,13 @@ func (v *botVerifier) verify(eng *searchEngine, ip string) bool {
 		v.mu.Unlock()
 		return c.ok
 	}
+	if call, ok := v.inflight[key]; ok {
+		v.mu.Unlock()
+		<-call.done
+		return call.ok
+	}
+	call := &botCall{done: make(chan struct{})}
+	v.inflight[key] = call
 	v.mu.Unlock()
 
 	ok := v.lookup(eng, ip)
@@ -153,11 +169,21 @@ func (v *botVerifier) verify(eng *searchEngine, ip string) bool {
 				delete(v.cache, k)
 			}
 		}
-		if len(v.cache) >= maxTrackedKeys {
-			v.cache = make(map[string]botVerdict)
+		// Still full: drop a tenth, not everything, so the verdicts for
+		// real crawlers aren't forgotten by a flood of fake ones.
+		drop := len(v.cache) - maxTrackedKeys + maxTrackedKeys/10
+		for k := range v.cache {
+			if drop <= 0 {
+				break
+			}
+			delete(v.cache, k)
+			drop--
 		}
 	}
 	v.cache[key] = botVerdict{ok: ok, expires: now.Add(ttl)}
+	delete(v.inflight, key)
+	call.ok = ok
+	close(call.done)
 	v.mu.Unlock()
 	return ok
 }

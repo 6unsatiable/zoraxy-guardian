@@ -103,7 +103,7 @@
 
   <section id="tab-protection" class="tab-panel">
     <h2>Protection</h2>
-    <p class="hint"><strong>waf_engine</strong>: OWASP Core Rule Set (paranoia 1-4; exclusions by host/path/rule ID). <strong>bot_protection</strong>: AI/SEO/headless crawlers, fake search engines, scripting libraries and fake browsers. <strong>challenge</strong>: a JavaScript proof-of-work on page loads for <em>hosts</em>; API paths (<em>exempt_paths</em>), apps (<em>app_user_agents</em>), credentialed and LAN requests are never challenged. <strong>threat_feeds</strong>: Spamhaus DROP / FireHOL level 1. <strong>behavior</strong>: temp-bans unverified clients that request more than <em>max_paths</em> distinct paths per window on challenge hosts.</p>
+    <p class="hint"><strong>waf_engine</strong>: OWASP Core Rule Set (paranoia 1-4; exclusions by host/path/rule ID). <strong>bot_protection</strong>: AI/SEO/headless crawlers, fake search engines, scripting libraries and fake browsers. <strong>challenge</strong> (<em>bind_cookie_to_network</em>: pass cookie only works from the same /24 or /48): a JavaScript proof-of-work on page loads for <em>hosts</em>; API paths (<em>exempt_paths</em>), apps (<em>app_user_agents</em>), credentialed and LAN requests are never challenged. <strong>threat_feeds</strong>: Spamhaus DROP / FireHOL level 1. <strong>behavior</strong>: temp-bans unverified clients that request more than <em>max_paths</em> distinct paths per window on challenge hosts.</p>
     <div id="protection-status" class="hint"></div>
     <textarea id="protection-json" rows="28" spellcheck="false" style="width:100%;font-family:monospace"></textarea>
   </section>
@@ -166,6 +166,9 @@
     <p class="hint">Turn this on if any site behind Zoraxy is proxied through Cloudflare (orange cloud). Without it, Guardian sees Cloudflare's servers instead of your visitors. Guardian never bans a proxy address either way, but it can't ban the real attacker until it can see them.</p>
     <label>Exempt clients (IP/CIDR, comma-sep) <input type="text" id="exempt-cidrs" placeholder="203.0.113.10, 192.168.1.0/24"></label>
     <p class="hint">Never blocked, banned or rate limited by Guardian, e.g. your own network or VPN, so a false positive can't lock you out. Don't add Zoraxy's Docker network or a proxy range here; that would exempt everyone.</p>
+    <label>Max request body (bytes, 0 = off) <input type="number" id="max-body-bytes" min="0" value="0"></label>
+    <label>Only for hosts (comma-sep, empty = all) <input type="text" id="max-body-hosts" placeholder="app.example.com"></label>
+    <p class="hint">Rejects requests whose declared Content-Length is larger (HTTP 413). Zoraxy never shows plugins the request body, so Guardian can't scan it; chunked uploads carry no length and pass. Leave off for hosts that take uploads.</p>
     <label><input type="checkbox" id="ignore-zoraxy-blacklist"> Don't mirror Zoraxy's own blacklist / geo blocks into the block log</label>
     <h2>Recommended rule updates</h2>
     <p class="hint">Preview or merge this release's UA, WAF, and honeypot rules. Your custom and host-scoped rules stay unchanged.</p>
