@@ -178,6 +178,13 @@ func parseFeed(data []byte) []*net.IPNet {
 	return out
 }
 
+// aiBotDeny lists upstream tokens too generic to substring-match User-Agents
+// (real browsers, search engines, link previews, editors).
+var aiBotDeny = map[string]bool{
+	"spider": true, "cursor": true, "operator": true, "devin": true, "useai": true, "applebot": true,
+	"facebookexternalhit": true, "openai": true,
+}
+
 // parseAIBots reads ai.robots.txt's robots.json: an object keyed by
 // User-Agent token.
 func parseAIBots(data []byte) []string {
