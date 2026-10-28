@@ -114,6 +114,8 @@
     $('#fingerprint-ban-secs').value = c.fingerprint_tracking?.ban_seconds ?? 3600;
     $('#trusted-proxy-cidrs').value = hostsToStr(c.trusted_proxy_cidrs);
     $('#trust-cloudflare').checked = !!c.trust_cloudflare;
+    $('#cloudflare-only').checked = !!c.cloudflare_only;
+    $('#direct-hosts').value = hostsToStr(c.direct_hosts);
     $('#exempt-cidrs').value = hostsToStr(c.exempt_cidrs);
     $('#ignore-zoraxy-blacklist').checked = !!c.ignore_zoraxy_blacklist;
     $('#max-body-bytes').value = c.max_body_bytes ?? 0;
@@ -165,6 +167,8 @@
       },
       trusted_proxy_cidrs: strToHosts($('#trusted-proxy-cidrs').value) || [],
       trust_cloudflare: $('#trust-cloudflare').checked,
+      cloudflare_only: $('#cloudflare-only').checked,
+      direct_hosts: strToHosts($('#direct-hosts').value) || [],
       exempt_cidrs: strToHosts($('#exempt-cidrs').value) || [],
       ignore_zoraxy_blacklist: $('#ignore-zoraxy-blacklist').checked,
       max_body_bytes: parseInt($('#max-body-bytes').value, 10) || 0,

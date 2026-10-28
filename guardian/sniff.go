@@ -42,6 +42,8 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	host := req.Host
 	trustedProxies := s.trustedProxies
 	exemptRules := s.exemptRules
+	cfOnly := s.cfg.CloudflareOnly
+	directHosts := s.cfg.DirectHosts
 	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	honeypotEnabled := s.cfg.Honeypot.Enabled
 	honeypotBanSecs := s.cfg.Honeypot.BanSeconds
@@ -67,6 +69,14 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 
 	ip := clientIP(req, trustedProxies)
 	parsedIP := net.ParseIP(ip)
+	// 0. Origin bypass: judged on the direct peer, before any forwarded
+	// header is believed. Exempt clients pass so they can't lock themselves out.
+	if cfOnly {
+		if peer := remoteIP(req.RemoteAddr); peer != nil && !isDirectPeerAllowed(peer, exemptRules, trustedProxies) &&
+			!(len(directHosts) > 0 && HostMatches(host, directHosts)) {
+			return Decision{Block: true, Reason: "origin-bypass", Status: http.StatusForbidden, IP: ip}
+		}
+	}
 	if parsedIP != nil && ipInRules(parsedIP, exemptRules) {
 		return Decision{Block: false, IP: ip}
 	}
@@ -399,6 +409,13 @@ func unhex(c byte) byte {
 	default:
 		return c - 'A' + 10
 	}
+}
+
+// isDirectPeerAllowed reports whether a connection from peer may reach any
+// host when CloudflareOnly is on.
+func isDirectPeerAllowed(peer net.IP, exemptRules, trustedProxies []compiledIPRule) bool {
+	return peer.IsPrivate() || peer.IsLoopback() || peer.IsLinkLocalUnicast() || isCloudflareIP(peer) ||
+		ipInRules(peer, exemptRules) || ipInRules(peer, trustedProxies)
 }
 
 func remoteIP(addr string) net.IP {

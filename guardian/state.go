@@ -47,6 +47,13 @@ type Config struct {
 	// TrustCloudflare adds Cloudflare's published edge ranges to the trusted
 	// proxies and honors CF-Connecting-IP from them.
 	TrustCloudflare bool `json:"trust_cloudflare"`
+	// CloudflareOnly blocks requests whose direct peer is not Cloudflare, a
+	// private address, an exempt client or a trusted proxy, unless the Host is
+	// in DirectHosts (DNS-only sites). Zoraxy routes on the Host header and
+	// ignores the TLS SNI, so without this a client allowed in for a direct
+	// host could front any other site through it.
+	CloudflareOnly bool     `json:"cloudflare_only"`
+	DirectHosts    []string `json:"direct_hosts"`
 	// ExemptCIDRs are client addresses Guardian never blocks, bans or rate
 	// limits (your own network or VPN). Checked before every other rule.
 	ExemptCIDRs []string `json:"exempt_cidrs"`
@@ -449,6 +456,9 @@ func mergeDefaults(c Config) Config {
 	if c.ExemptCIDRs == nil {
 		c.ExemptCIDRs = []string{}
 	}
+	if c.DirectHosts == nil {
+		c.DirectHosts = []string{}
+	}
 	if c.MaxBodyHosts == nil {
 		c.MaxBodyHosts = []string{}
 	}
@@ -801,6 +811,7 @@ func (s *Store) Snapshot() Config {
 	cfg.Honeypot.Paths = append([]ScopedEntry{}, s.cfg.Honeypot.Paths...)
 	cfg.TrustedProxyCIDRs = append([]string{}, s.cfg.TrustedProxyCIDRs...)
 	cfg.ExemptCIDRs = append([]string{}, s.cfg.ExemptCIDRs...)
+	cfg.DirectHosts = append([]string{}, s.cfg.DirectHosts...)
 	cfg.WAFEngine.Exclusions = append([]WAFExclusion{}, s.cfg.WAFEngine.Exclusions...)
 	cfg.Challenge.Hosts = append([]string{}, s.cfg.Challenge.Hosts...)
 	cfg.Challenge.ExemptPaths = append([]ScopedEntry{}, s.cfg.Challenge.ExemptPaths...)

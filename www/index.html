@@ -164,6 +164,9 @@
     <p class="hint">Forwarded client-IP headers are used only when Zoraxy's direct peer matches one of these CIDRs. Leave empty if Zoraxy receives traffic directly.</p>
     <label><input type="checkbox" id="trust-cloudflare"> Trust Cloudflare (built-in edge ranges; uses <code>CF-Connecting-IP</code>)</label>
     <p class="hint">Turn this on if any site behind Zoraxy is proxied through Cloudflare (orange cloud). Without it, Guardian sees Cloudflare's servers instead of your visitors. Guardian never bans a proxy address either way, but it can't ban the real attacker until it can see them.</p>
+    <label><input type="checkbox" id="cloudflare-only"> Cloudflare only: block direct connections</label>
+    <label>Except for hosts (comma-sep) <input type="text" id="direct-hosts" placeholder="notes.example.com"></label>
+    <p class="hint">Blocks requests whose direct peer is not Cloudflare, a private/LAN address, an exempt client or a trusted proxy (HTTP 403, reason <code>origin-bypass</code>), unless the Host is listed here. Use it when your sites are orange-clouded and only a few DNS-only hosts are meant to be reached directly; it also stops domain fronting through those hosts.</p>
     <label>Exempt clients (IP/CIDR, comma-sep) <input type="text" id="exempt-cidrs" placeholder="203.0.113.10, 192.168.1.0/24"></label>
     <p class="hint">Never blocked, banned or rate limited by Guardian, e.g. your own network or VPN, so a false positive can't lock you out. Don't add Zoraxy's Docker network or a proxy range here; that would exempt everyone.</p>
     <label>Max request body (bytes, 0 = off) <input type="number" id="max-body-bytes" min="0" value="0"></label>
